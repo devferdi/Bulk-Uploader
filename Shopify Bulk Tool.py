@@ -95,9 +95,32 @@ class RedirectOutput(io.StringIO):
         super().__init__(*args, **kwargs)
         self.text_area = text_area
 
+        # Ensure the redirected output uses a readable, high-contrast style. Some
+        # macOS Tk builds inherit a near-white foreground, which can make the
+        # text effectively invisible against the default background when the app
+        # is bundled. Explicit styling guarantees the log remains legible.
+        self.text_area.configure(
+            bg="#FAFAFA", fg="#0F0F0F", insertbackground="#0F0F0F",
+            selectbackground="#0F62FE", selectforeground="#FFFFFF"
+        )
+        self.text_area.tag_configure("stdout", foreground="#0F0F0F")
+
     def write(self, msg):
-        self.text_area.insert(tk.END, msg)
-        self.text_area.see(tk.END)  # Auto scroll to the end
+        if not msg:
+            return
+
+        def append():
+            if not self.text_area.winfo_exists():
+                return
+            self.text_area.insert(tk.END, msg, "stdout")
+            self.text_area.see(tk.END)  # Auto scroll to the end
+
+        # Tkinter isn't thread-safe. Schedule GUI updates on the main thread.
+        try:
+            self.text_area.after(0, append)
+        except RuntimeError:
+            # If the widget is being destroyed, silently ignore further writes.
+            pass
 
     def flush(self):
         pass  # The flush method is required for compatibility with `sys.stdout`
@@ -3174,49 +3197,49 @@ def load_background_logic():
     import base64
     print("Additional logic loaded successfully.")
 
+    
 # Set up Tkinter GUI
 root = tk.Tk()
 root.title("Shopify Tool")
 
-# Create the text box (for output display)
-text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=10, width=60)
-text_area.pack(pady=10)
+# Let row 0 (text area) expand, and column 0+1 share space
+root.rowconfigure(0, weight=1)
+root.columnconfigure(0, weight=1)
+root.columnconfigure(1, weight=1)
+
+# Text area in row 0
+text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+
 sys.stdout = RedirectOutput(text_area)
 
-# Create Download button
+# Buttons in rows below
 download_button = tk.Button(root, text="Download", command=start_download, width=20, height=2)
-download_button.pack(pady=10)
+download_button.grid(row=1, column=0, pady=5)
 
-# Create Upload button
 upload_button = tk.Button(root, text="Upload", command=start_upload, width=20, height=2)
-upload_button.pack(pady=10)
+upload_button.grid(row=1, column=1, pady=5)
 
-
-# Create Collection Download button
 collection_download_button = tk.Button(root, text="Download Collections", command=start_collection_download, width=20, height=2)
-collection_download_button.pack(pady=10)
+collection_download_button.grid(row=2, column=0, pady=5)
 
-# Create Collection Upload button
 collection_upload_button = tk.Button(root, text="Upload Collections", command=start_collection_upload, width=20, height=2)
-collection_upload_button.pack(pady=10)
+collection_upload_button.grid(row=2, column=1, pady=5)
 
 file_alt_download_button = tk.Button(root, text="Download Files Alt Texts", command=lambda: threading.Thread(target=download_shopify_files_alt_texts).start(), width=25, height=2)
-file_alt_download_button.pack(pady=10)
+file_alt_download_button.grid(row=3, column=0, pady=5)
 
 file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: threading.Thread(target=upload_shopify_files_alt_texts).start(), width=25, height=2)
-file_alt_upload_button.pack(pady=10)
+file_alt_upload_button.grid(row=3, column=1, pady=5)
 
 seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: threading.Thread(target=generate_seo_alt_texts).start(), width=30, height=2)
-seo_alt_text_button.pack(pady=10)
-
+seo_alt_text_button.grid(row=4, column=0, columnspan=2, pady=5)
 
 # Set window size
 root.geometry("500x700")
 
-
 # Show the window first, then load heavy logic in the background
 root.after(100, lambda: threading.Thread(target=load_background_logic).start())
-
 
 # Run the application
 root.mainloop()
