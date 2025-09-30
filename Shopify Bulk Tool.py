@@ -3211,7 +3211,9 @@ root.columnconfigure(1, weight=1)
 text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
 text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
 
-sys.stdout = RedirectOutput(text_area)
+use_gui_log = False
+if use_gui_log:
+    sys.stdout = RedirectOutput(text_area)
 
 # Buttons in rows below
 download_button = tk.Button(root, text="Download", command=start_download, width=20, height=2)
