@@ -1311,11 +1311,43 @@ def run_uploader_logic():
         return all_files
 
     # Function to update or create metafields for a product
+    def upsert_metafield(owner_type, owner_id, namespace, key, metafield_data, current_metafields_dict):
+        """Create or update a metafield for the given owner."""
+        metafield_key = f"{namespace}.{key}"
+        existing_metafield_id = current_metafields_dict.get(metafield_key)
+
+        if existing_metafield_id:
+            payload = {"metafield": {"id": existing_metafield_id}}
+            payload["metafield"].update(metafield_data["metafield"])
+            url = f"{BASE_URL}/metafields/{existing_metafield_id}.json"
+            response = requests.put(url, headers=headers, json=payload)
+            action = "updated"
+        else:
+            endpoint = "products" if owner_type == "product" else "variants"
+            url = f"{BASE_URL}/{endpoint}/{owner_id}/metafields.json"
+            response = requests.post(url, headers=headers, json=metafield_data)
+            action = "created"
+
+        if response.status_code in [200, 201]:
+            metafield_response = response.json().get("metafield", {})
+            metafield_id = metafield_response.get("id", existing_metafield_id)
+            if metafield_id:
+                current_metafields_dict[metafield_key] = metafield_id
+            print(
+                f"✅ Successfully {action} metafield {namespace}.{key} for {owner_type} {owner_id}"
+            )
+        else:
+            print(
+                f"❌ Failed to {action} metafield {namespace}.{key} for {owner_type} {owner_id}: {response.status_code}"
+            )
+            print(f"⚠️ Response Body: {response.text}")
+
     def update_metafields(handle, metafields, existing_files, row_index, df):
         product_id = handle
         if not product_id:
             print(f"Skipping metafield update for missing product ID.")
             return
+
 
         # Fetch current metafields to handle deletion if necessary
         current_metafields_url = f"{BASE_URL}/products/{product_id}/metafields.json"
@@ -1335,6 +1367,7 @@ def run_uploader_logic():
                 metafield_key = f"{namespace}.{key}"
                 if metafield_key in current_metafields_dict:
                     delete_metafield(product_id, current_metafields_dict[metafield_key])
+                    current_metafields_dict.pop(metafield_key, None)
                 continue  # Skip to the next metafield if it's being deleted
 
             # For file_reference metafields
@@ -1489,21 +1522,9 @@ def run_uploader_logic():
                 print(f"Other metafield data: {metafield_data}")
 
 
-            url = f"{BASE_URL}/products/{product_id}/metafields.json"
-
-            print(f"📡 Sending request to Shopify API: {url}")
-            print(f"🔍 Headers: {json.dumps(headers, indent=2)}")
-            print(f"📝 Payload: {json.dumps(metafield_data, indent=2)}")
-
-            response = requests.post(url, headers=headers, json=metafield_data)
-
-            print(f"📩 Shopify Response: {response.status_code}")
-
-            if response.status_code in [200, 201]:
-                print(f"✅ Successfully updated metafield {namespace}.{key} for product {product_id}")
-            else:
-                print(f"❌ Failed to update metafield {namespace}.{key} for product {product_id}: {response.status_code}")
-                print(f"⚠️ Response Body: {response.text}")
+            upsert_metafield(
+                "product", product_id, namespace, key, metafield_data, current_metafields_dict
+            )
 
 
 
@@ -1528,6 +1549,7 @@ def run_uploader_logic():
                 metafield_key = f"{namespace}.{key}"
                 if metafield_key in current_metafields_dict:
                     delete_metafield(variant_id, current_metafields_dict[metafield_key])
+                    current_metafields_dict.pop(metafield_key, None)
                 continue
 
             if field_type == 'file_reference':
@@ -1646,13 +1668,9 @@ def run_uploader_logic():
                     }
                 }
 
-            metafield_url = f"{BASE_URL}/variants/{variant_id}/metafields.json"
-            response = requests.post(metafield_url, headers=headers, json=metafield_data)
-            if response.status_code in [200, 201]:
-                print(f"Successfully updated metafield {namespace}.{key} for variant {variant_id}")
-            else:
-                print(f"Failed to update metafield {namespace}.{key} for variant {variant_id}: {response.status_code}")
-                print(f"Response Body: {response.text}")
+            upsert_metafield(
+                "variant", variant_id, namespace, key, metafield_data, current_metafields_dict
+            )
 
 
 
