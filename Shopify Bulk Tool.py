@@ -1771,7 +1771,31 @@ def run_uploader_logic():
         }
         print(f"Pricing columns identified: {pricing_columns}")
 
-       
+        def collect_metafields_from_row(row_data, prefix):
+            collected = {}
+            for col_name in df.columns:
+                if not col_name.startswith(prefix):
+                    continue
+
+                value = row_data.get(col_name)
+                if pd.isna(value):
+                    continue
+
+                if (
+                    "[rich_text_field]" in col_name
+                    and isinstance(value, str)
+                    and "<" in value
+                    and ">" in value
+                ):
+                    try:
+                        collected[col_name] = html_to_shopify_json(value)
+                    except Exception as err:
+                        print(f"Error parsing HTML for {col_name}: {err}")
+                else:
+                    collected[col_name] = value
+
+            return collected
+
         def get_price_list_id_for_market(market_name):
             query = f"""
             query {{
@@ -1983,6 +2007,9 @@ def run_uploader_logic():
                 print(f"Skipping row {index} due to missing product title and variant name.")
                 continue
 
+            metafields = collect_metafields_from_row(row, 'Metafield:')
+            variant_metafields = collect_metafields_from_row(row, 'Variant Metafield:')
+
             # Prepare the product update data if the Product ID is available
             if row.get('Title'):
 
@@ -2188,34 +2215,9 @@ def run_uploader_logic():
                             if image_src in images:
                                 index_in_list = images.index(image_src)
                                 alt_text = alt_texts[index_in_list]
-                                
+
                     else:
                         print(f"Failed to retrieve images for product {product_id}: {response.status_code}, {response.text}")
-
- # Process metafields
-                def collect_metafields_from_row(row_data, prefix):
-                    collected = {}
-                    for col_name in df.columns:
-                        if not col_name.startswith(prefix):
-                            continue
-
-                        value = row_data.get(col_name)
-                        if pd.isna(value):
-                            continue
-
-                        if '[rich_text_field]' in col_name and isinstance(value, str) and '<' in value and '>' in value:
-                            try:
-                                collected[col_name] = html_to_shopify_json(value)
-                            except Exception as err:
-                                print(f"Error parsing HTML for {col_name}: {err}")
-                        else:
-                            collected[col_name] = value
-
-                    return collected
-
-                metafields = collect_metafields_from_row(row, 'Metafield:')
-                variant_metafields = collect_metafields_from_row(row, 'Variant Metafield:')
-
 
                 # Update metafields for the product
                 if metafields:
