@@ -263,7 +263,7 @@ def run_downloader_logic():
         else:
             print(f"Failed to fetch image URL for gid {gid}: {response.status_code}")
             return None
-
+  
     def fetch_all_metafields(products):
         print("Fetching metafields for all products concurrently...")
         product_id_to_metafields = {}
@@ -279,6 +279,27 @@ def run_downloader_logic():
                     product_id_to_metafields[product['id']] = []
         print("Finished fetching metafields.")
         return product_id_to_metafields
+
+    def fetch_all_variant_metafields(variant_ids):
+        if not variant_ids:
+            return {}
+
+        print("Fetching metafields for all variants concurrently...")
+        variant_id_to_metafields = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_variant = {
+                executor.submit(get_metafields, variant_id, "variant"): variant_id for variant_id in variant_ids
+            }
+            for future in concurrent.futures.as_completed(future_to_variant):
+                variant_id = future_to_variant[future]
+                try:
+                    metafields = future.result()
+                    variant_id_to_metafields[variant_id] = metafields
+                except Exception as exc:
+                    print(f"Variant ID {variant_id} generated an exception: {exc}")
+                    variant_id_to_metafields[variant_id] = []
+        print("Finished fetching variant metafields.")
+        return variant_id_to_metafields
 
     def get_inventory_levels(inventory_item_ids):
         print("Fetching inventory levels for all variants...")
@@ -332,7 +353,7 @@ def run_downloader_logic():
 
         # Fetch metafields for all products concurrently
         product_id_to_metafields = fetch_all_metafields(products)
-
+        variant_id_to_metafields = fetch_all_variant_metafields(list(set(variant_ids)))
 
         # Second pass to add data, including images and inventory levels
         product_count = len(products)
@@ -419,7 +440,8 @@ def run_downloader_logic():
                 product_data[f"Image {i + 1}"] = image_url
                 product_data[f"Image {i + 1} Alt"] = image_alt
 
-            # Add product-level metafields after the images
+            
+             # Add product-level metafields after the images
             metafields = product_id_to_metafields.get(product['id'], [])
             for metafield in metafields:
                 key = metafield['key']
@@ -427,6 +449,17 @@ def run_downloader_logic():
                 namespace = metafield['namespace']
                 field_type = metafield.get('type', 'unknown')
                 column_name = f"Metafield: {namespace}.{key} [{field_type}]"
+                all_metafield_keys.add(column_name)
+                product_data[column_name] = value
+
+            # Add variant-level metafields for the first variant
+            first_variant_metafields = variant_id_to_metafields.get(first_variant.get('id'), [])
+            for metafield in first_variant_metafields:
+                key = metafield['key']
+                value = metafield['value']
+                namespace = metafield['namespace']
+                field_type = metafield.get('type', 'unknown')
+                column_name = f"Variant Metafield: {namespace}.{key} [{field_type}]"
                 all_metafield_keys.add(column_name)
                 product_data[column_name] = value
 
@@ -481,6 +514,16 @@ def run_downloader_logic():
                     key = (variant.get('inventory_item_id'), location_id)
                     inventory_level = inventory_mapping.get(key, 0)
                     variant_data[f"Inventory Available: {location_name}"] = inventory_level
+
+                variant_metafields = variant_id_to_metafields.get(variant.get('id'), [])
+                for metafield in variant_metafields:
+                    key = metafield['key']
+                    value = metafield['value']
+                    namespace = metafield['namespace']
+                    field_type = metafield.get('type', 'unknown')
+                    column_name = f"Variant Metafield: {namespace}.{key} [{field_type}]"
+                    all_metafield_keys.add(column_name)
+                    variant_data[column_name] = value
 
                 # Append the variant row
                 data.append(variant_data)
@@ -974,13 +1017,13 @@ def run_uploader_logic():
 
 
     # Function to delete a metafield
-    def delete_metafield(product_id, metafield_id):
+    def delete_metafield(owner_id, metafield_id):
         url = f"{BASE_URL}/metafields/{metafield_id}.json"
         response = requests.delete(url, headers=headers)
         if response.status_code == 200:
-            print(f"Successfully deleted metafield {metafield_id} for product {product_id}")
+            print(f"Successfully deleted metafield {metafield_id} for owner {owner_id}")
         else:
-            print(f"Failed to delete metafield {metafield_id} for product {product_id}: {response.status_code}, {response.text}")
+            print(f"Failed to delete metafield {metafield_id} for owner {owner_id}: {response.status_code}, {response.text}")
 
     # Function to create a staged upload
     def staged_upload_create(filename, mime_type):
@@ -1414,6 +1457,153 @@ def run_uploader_logic():
             else:
                 print(f"❌ Failed to update metafield {namespace}.{key} for product {product_id}: {response.status_code}")
                 print(f"⚠️ Response Body: {response.text}")
+
+
+
+    def update_variant_metafields(variant_id, metafields, existing_files, row_index, df):
+        if not variant_id:
+            print("Skipping metafield update for missing variant ID.")
+            return
+
+        current_metafields_url = f"{BASE_URL}/variants/{variant_id}/metafields.json"
+        response = requests.get(current_metafields_url, headers=headers)
+        current_metafields = response.json().get('metafields', []) if response.status_code == 200 else []
+        current_metafields_dict = {f"{mf['namespace']}.{mf['key']}": mf['id'] for mf in current_metafields}
+
+        for column, value in metafields.items():
+            key_type_str = column.replace('Variant Metafield: ', '').split(' ')
+            key = key_type_str[0]
+            field_type = key_type_str[1].replace('[', '').replace(']', '') if len(key_type_str) > 1 else 'single_line_text_field'
+
+            namespace, key = key.split('.')
+
+            if pd.isna(value) or value is None:
+                metafield_key = f"{namespace}.{key}"
+                if metafield_key in current_metafields_dict:
+                    delete_metafield(variant_id, current_metafields_dict[metafield_key])
+                continue
+
+            if field_type == 'file_reference':
+                if isinstance(value, str):
+                    if value.startswith('gid://'):
+                        value_gid = value
+                    elif value.startswith('http'):
+                        filename = os.path.basename(value)
+                        value_gid = existing_files.get(filename, (None,))[0]
+                    else:
+                        filename = value
+                        if filename in existing_files:
+                            gid, url = existing_files[filename]
+                            value_gid = gid
+                            df.at[row_index, column] = value_gid
+                        else:
+                            file_path_local = os.path.join(IMAGE_FOLDER, filename)
+                            if os.path.exists(file_path_local):
+                                url, gid = upload_image_to_shopify(file_path_local)
+                                if gid:
+                                    existing_files[filename] = (gid, url)
+                                    value_gid = gid
+                                    df.at[row_index, column] = url
+                                else:
+                                    print(f"Failed to upload image {filename}")
+                                    continue
+                            else:
+                                print(f"Image file {filename} not found in local folder.")
+                                continue
+                else:
+                    continue
+
+                if value_gid:
+                    metafield_data = {
+                        "metafield": {
+                            "namespace": namespace,
+                            "key": key,
+                            "value": value_gid,
+                            "type": field_type.strip()
+                        }
+                    }
+                else:
+                    print(f"Cannot find GID for file {filename}")
+                    continue
+
+            elif field_type == 'list.file_reference':
+                if isinstance(value, str):
+                    file_names = [filename.strip() for filename in value.split(",") if filename.strip()]
+                    file_gids = []
+
+                    for filename in file_names:
+                        value_gid = None
+
+                        if filename.startswith('gid://'):
+                            value_gid = filename
+                        elif filename.startswith('http'):
+                            base_filename = os.path.basename(filename)
+                            value_gid = existing_files.get(base_filename, [None])[0]
+                        else:
+                            if filename in existing_files:
+                                gid, url = existing_files[filename]
+                                value_gid = gid
+                                df.at[row_index, column] = value_gid
+                            else:
+                                file_path_local = os.path.join(IMAGE_FOLDER, filename)
+                                if os.path.exists(file_path_local):
+                                    url, gid = upload_image_to_shopify(file_path_local)
+                                    if gid:
+                                        existing_files[filename] = (gid, url)
+                                        value_gid = gid
+                                        df.at[row_index, column] = url
+                                    else:
+                                        print(f"Failed to upload image {filename}")
+                                        continue
+                                else:
+                                    print(f"Image file {filename} not found in local folder.")
+                                    continue
+
+                        if value_gid:
+                            file_gids.append(value_gid)
+                        else:
+                            print(f"Cannot find GID for file {filename}")
+
+                    if file_gids:
+                        metafield_data = {
+                            "metafield": {
+                                "namespace": namespace,
+                                "key": key,
+                                "value": json.dumps(file_gids),
+                                "type": "list.file_reference"
+                            }
+                        }
+                    else:
+                        print(f"Skipping metafield update for '{key}' because the file list is empty.")
+                        continue
+                else:
+                    print(f"Skipping non-string value for metafield {key}.")
+                    continue
+
+            else:
+                if field_type == 'rich_text_field':
+                    try:
+                        value = json.dumps(value) if isinstance(value, dict) else value
+                    except Exception as e:
+                        print(f"Error serializing JSON for {namespace}.{key}: {e}")
+                        continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": value,
+                        "type": field_type.strip()
+                    }
+                }
+
+            metafield_url = f"{BASE_URL}/variants/{variant_id}/metafields.json"
+            response = requests.post(metafield_url, headers=headers, json=metafield_data)
+            if response.status_code in [200, 201]:
+                print(f"Successfully updated metafield {namespace}.{key} for variant {variant_id}")
+            else:
+                print(f"Failed to update metafield {namespace}.{key} for variant {variant_id}: {response.status_code}")
+                print(f"Response Body: {response.text}")
 
 
 
@@ -1907,21 +2097,31 @@ def run_uploader_logic():
                     else:
                         print(f"Failed to retrieve images for product {product_id}: {response.status_code}, {response.text}")
 
-                # Process metafields
+ # Process metafields
                 metafields = {}
+                variant_metafields = {}
                 for column in df.columns:
                     if column.startswith('Metafield:'):
                         value = row[column]
-                        # Check if it's a rich text field and contains HTML
                         if '[rich_text_field]' in column and isinstance(value, str) and '<' in value and '>' in value:
                             try:
-                                json_value = html_to_shopify_json(value)  # Convert HTML to Shopify JSON format
+                                json_value = html_to_shopify_json(value)
                                 metafields[column] = json_value
                             except Exception as e:
                                 print(f"Error parsing HTML for {column}: {e}")
                         else:
-                            # For other fields, upload the value as is
                             metafields[column] = value
+                    elif column.startswith('Variant Metafield:'):
+                        value = row[column]
+                        if '[rich_text_field]' in column and isinstance(value, str) and '<' in value and '>' in value:
+                            try:
+                                json_value = html_to_shopify_json(value)
+                                variant_metafields[column] = json_value
+                            except Exception as e:
+                                print(f"Error parsing HTML for {column}: {e}")
+                        else:
+                            variant_metafields[column] = value
+
 
                 # Update metafields for the product
                 if metafields:
@@ -2011,8 +2211,12 @@ def run_uploader_logic():
                     else:
                         print(f"[INFO] Market '{market_name}' from column '{column}' not found in Shopify markets. Skipping.")
 
-            else:
-                print(f"Failed to process variant for handle '{handle}'.")
+                        if variant_metafields:
+                            update_variant_metafields(variant_id, variant_metafields, existing_files, index, df)
+
+                else:
+                    print(f"Failed to process variant for handle '{handle}'.")
+
 
 
 
