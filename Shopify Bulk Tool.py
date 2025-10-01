@@ -627,6 +627,81 @@ def run_uploader_logic():
     # Image folder path
     IMAGE_FOLDER = os.path.join(script_dir, 'img')  # Adjusted to your images folder
 
+    def fetch_primary_location_id():
+        """Retrieve the first active Shopify location for inventory updates."""
+        url = f"{BASE_URL}/locations.json"
+        try:
+            response = requests.get(url, headers=headers)
+        except requests.RequestException as exc:
+            print(f"Failed to fetch locations due to network error: {exc}")
+            return None
+
+        if response.status_code != 200:
+            print(f"Failed to fetch locations: {response.status_code}, {response.text}")
+            return None
+
+        locations = response.json().get("locations", [])
+        if not locations:
+            print("No Shopify locations available to update inventory levels.")
+            return None
+
+        # Prefer active locations; fall back to the first entry if none are marked active
+        active_locations = [loc for loc in locations if loc.get("active", True)]
+        selected_location = (active_locations or locations)[0]
+
+        location_id = selected_location.get("id")
+        location_name = selected_location.get("name", "Unknown")
+        print(f"Using location '{location_name}' (ID: {location_id}) for inventory updates.")
+        return location_id
+
+    primary_location_id = fetch_primary_location_id()
+
+    def set_inventory_level(inventory_item_id, quantity):
+        """Synchronize the available inventory for an item at the primary location."""
+        if inventory_item_id is None:
+            print("Cannot update inventory: missing inventory_item_id.")
+            return
+
+        if primary_location_id is None:
+            print("Cannot update inventory: no Shopify location available.")
+            return
+
+        if quantity is None:
+            print("Inventory quantity is None; skipping inventory update.")
+            return
+
+        try:
+            available_quantity = int(float(quantity))
+        except (TypeError, ValueError):
+            print(f"Invalid inventory quantity '{quantity}' provided; skipping inventory update.")
+            return
+
+        payload = {
+            "location_id": primary_location_id,
+            "inventory_item_id": inventory_item_id,
+            "available": available_quantity
+        }
+
+        try:
+            response = requests.post(
+                f"{BASE_URL}/inventory_levels/set.json",
+                headers=headers,
+                json=payload
+            )
+        except requests.RequestException as exc:
+            print(f"Network error while setting inventory level: {exc}")
+            return
+
+        if response.status_code in (200, 201):
+            print(
+                f"Inventory updated for item {inventory_item_id} at location {primary_location_id} to {quantity}."
+            )
+        else:
+            print(
+                f"Failed to set inventory level for item {inventory_item_id}: "
+                f"{response.status_code}, {response.text}"
+            )
+
     # Function to clean data by removing NaN values and converting them to None
     def clean_data(data):
         """
@@ -919,14 +994,22 @@ def run_uploader_logic():
             print("Product ID is required to create or update a variant.")
             return
 
+        inventory_qty = None
+        if isinstance(updated_data, dict):
+            inventory_qty = updated_data.get("variant", {}).get("inventory_quantity")
+
         if variant_id:
             url = f"{BASE_URL}/variants/{variant_id}.json"
-            updated_data = clean_data(updated_data)
-            updated_data["variant"].pop('inventory_quantity', None)
+            cleaned_data = clean_data(updated_data)
+            cleaned_data["variant"].pop('inventory_quantity', None)
 
-            response = requests.put(url, headers=headers, json=updated_data)
+            response = requests.put(url, headers=headers, json=cleaned_data)
             if response.status_code == 200:
                 print(f"Successfully updated variant {variant_id}")
+                if inventory_qty is not None:
+                    variant_payload = response.json().get("variant", {})
+                    inventory_item_id = variant_payload.get("inventory_item_id")
+                    set_inventory_level(inventory_item_id, inventory_qty)
             elif response.status_code == 404:
                 print(f"Variant {variant_id} not found. Creating new variant.")
                 create_new_variant(product_id, updated_data)
@@ -1011,16 +1094,22 @@ def run_uploader_logic():
         }
         updated_data["variant"].update(required_options)
 
-        # Clean the data to remove NaN or unsupported values
-        updated_data = clean_data(updated_data)
-        updated_data["variant"]["product_id"] = product_id  # Explicitly link to product
+        inventory_qty = updated_data["variant"].get("inventory_quantity") if isinstance(updated_data, dict) else None
 
-        response = requests.post(url, headers=headers, json=updated_data)
+        # Clean the data to remove NaN or unsupported values
+        cleaned_data = clean_data(updated_data)
+        cleaned_data["variant"]["product_id"] = product_id  # Explicitly link to product
+
+        response = requests.post(url, headers=headers, json=cleaned_data)
         if response.status_code in [200, 201]:
             # Variant created successfully
             created_variant = response.json().get('variant', {})
             variant_id = created_variant.get('id')
             print(f"Variant created successfully for product ID {product_id}. Variant ID: {variant_id}")
+
+            if inventory_qty is not None:
+                inventory_item_id = created_variant.get("inventory_item_id")
+                set_inventory_level(inventory_item_id, inventory_qty)
 
             # Fetch all variants for the product after creating the new variant
             variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
