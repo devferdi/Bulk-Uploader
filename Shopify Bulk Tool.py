@@ -17,6 +17,7 @@ from openpyxl.styles import Font
 from openpyxl import Workbook, load_workbook
 import requests
 import re
+import numbers
 from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
@@ -37,6 +38,32 @@ def file_exists_in_folder(folder, filename):
 # URL-encode the filename to handle special characters like umlauts
 def encode_filename(filename):
     return urllib.parse.quote(filename)
+
+
+def format_metafield_text_value(value):
+    """Format metafield text values to avoid unintended decimal suffixes."""
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, bool):
+        return str(value)
+
+    if isinstance(value, numbers.Number):
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+        if pd.isna(numeric_value):
+            return ""
+
+        if float(numeric_value).is_integer():
+            return str(int(numeric_value))
+
+        formatted = ("{0:f}".format(numeric_value)).rstrip("0").rstrip(".")
+        return formatted if formatted else "0"
+
+    return str(value)
 
 # Function to convert HTML to Shopify JSON
 def html_to_shopify_json(html_input):
@@ -928,11 +955,29 @@ def run_uploader_logic():
 
                 if variants_response.status_code == 200:
                     variants = variants_response.json().get('variants', [])
-                    # Try to find a matching variant by title
-                    existing_variant = next(
-                        (v for v in variants if v['title'] == variant_data['variant']['option1']),
-                        None
-                    )
+
+                    def normalize_option(value):
+                        if value is None:
+                            return None
+                        if isinstance(value, str):
+                            value = value.strip()
+                            return value if value else None
+                        return str(value)
+
+                    target_option1 = normalize_option(variant_data["variant"].get("option1"))
+                    target_option2 = normalize_option(variant_data["variant"].get("option2"))
+                    target_option3 = normalize_option(variant_data["variant"].get("option3"))
+
+                    def is_matching_variant(variant):
+                        if normalize_option(variant.get("option1")) != target_option1:
+                            return False
+                        if target_option2 is not None and normalize_option(variant.get("option2")) != target_option2:
+                            return False
+                        if target_option3 is not None and normalize_option(variant.get("option3")) != target_option3:
+                            return False
+                        return True
+
+                    existing_variant = next((v for v in variants if is_matching_variant(v)), None)
                     if existing_variant:
                         variant_id = existing_variant['id']
                         print(f"Existing variant found with ID {variant_id}. Updating variant.")
@@ -1429,6 +1474,8 @@ def run_uploader_logic():
                     except Exception as e:
                         print(f"Error serializing JSON for {namespace}.{key}: {e}")
                         continue
+                elif field_type in ('single_line_text_field', 'multi_line_text_field'):
+                    value = format_metafield_text_value(value)
 
                 # For other metafield types
                 metafield_data = {
@@ -1587,6 +1634,8 @@ def run_uploader_logic():
                     except Exception as e:
                         print(f"Error serializing JSON for {namespace}.{key}: {e}")
                         continue
+                elif field_type in ('single_line_text_field', 'multi_line_text_field'):
+                    value = format_metafield_text_value(value)
 
                 metafield_data = {
                     "metafield": {
@@ -2860,24 +2909,26 @@ def collection_run_uploader_logic():
 
             # ✅ Handle single-line text fields
             elif field_type == 'single_line_text_field':
-                print(f"📌 Adding single-line text metafield: '{value}'")
+                formatted_value = format_metafield_text_value(value)
+                print(f"📌 Adding single-line text metafield: '{formatted_value}'")
                 metafield_data = {
                     "metafield": {
                         "namespace": namespace,
                         "key": key,
-                        "value": str(int(value)) if isinstance(value, float) and value.is_integer() else str(value),
+                        "value": formatted_value,
                         "type": "single_line_text_field"
                     }
                 }
 
             # ✅ Handle multi-line text fields (Fix for your issue)
             elif field_type == 'multi_line_text_field':
-                print(f"📌 Adding multi-line text metafield: '{value}'")
+                formatted_value = format_metafield_text_value(value)
+                print(f"📌 Adding multi-line text metafield: '{formatted_value}'")
                 metafield_data = {
                     "metafield": {
                         "namespace": namespace,
                         "key": key,
-                        "value": str(int(value)) if isinstance(value, float) and value.is_integer() else str(value),
+                        "value": formatted_value,
                         "type": "multi_line_text_field"
                     }
                 }
