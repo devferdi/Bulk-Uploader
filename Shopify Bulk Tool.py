@@ -1913,15 +1913,31 @@ def run_uploader_logic():
 
 
             if pd.notna(handle):
-                handle = str(handle).split(".")[0].lower().replace(" ", "-").replace("/", "-")
-                last_valid_handle = handle  # Update the last valid handle if the current row has one
-            
-                print(f"Handle='{handle}'")
+                original_handle_value = str(handle)
+                handle_candidate = original_handle_value.split(".")[0].lower().replace(" ", "-").replace("/", "-")
+                handle_candidate = re.sub(r"[^a-z0-9-]", "", handle_candidate)
 
+                if handle_candidate:
+                    handle = handle_candidate
+                    last_valid_handle = handle  # Update the last valid handle if the current row has one
+                elif last_valid_handle:
+                    print(
+                        f"Detected invalid handle '{original_handle_value}'. Reusing last known valid handle '{last_valid_handle}'."
+                    )
+                    handle = last_valid_handle
+                else:
+                    print(f"Detected invalid handle '{original_handle_value}' and no prior handle to reuse. Skipping row {index}.")
+                    continue
+                    print(f"Handle='{handle}'")
+
+
+            elif not handle and last_valid_handle:
+                handle = last_valid_handle
+                print(f"Reusing last known handle '{handle}' for row {index}.")
 
             # Use SKU if handle is not available
             elif not handle and pd.notna(sku):
-                print(f"No handle found. Using SKU '{sku}' as identifier.")
+                print(f"No handle found. Using SKU '{sku}' as identifier.") 
             elif not handle:
                 print(f"Skipping row {index} due to missing handle and SKU.")
                 continue
@@ -2057,6 +2073,9 @@ def run_uploader_logic():
 
                 if product_id:
                     print(f"Product created successfully with ID '{product_id}' and Variand ID '{variant_id}'  .")
+                    df.at[index, 'ID'] = product_id
+                    if variant_id:
+                        df.at[index, 'Variant ID'] = variant_id
 
 
                     # Handle market-specific pricing dynamically
@@ -2156,29 +2175,28 @@ def run_uploader_logic():
                         print(f"Failed to retrieve images for product {product_id}: {response.status_code}, {response.text}")
 
  # Process metafields
-                metafields = {}
-                variant_metafields = {}
-                for column in df.columns:
-                    if column.startswith('Metafield:'):
-                        value = row[column]
-                        if '[rich_text_field]' in column and isinstance(value, str) and '<' in value and '>' in value:
+                def collect_metafields_from_row(row_data, prefix):
+                    collected = {}
+                    for col_name in df.columns:
+                        if not col_name.startswith(prefix):
+                            continue
+
+                        value = row_data.get(col_name)
+                        if pd.isna(value):
+                            continue
+
+                        if '[rich_text_field]' in col_name and isinstance(value, str) and '<' in value and '>' in value:
                             try:
-                                json_value = html_to_shopify_json(value)
-                                metafields[column] = json_value
-                            except Exception as e:
-                                print(f"Error parsing HTML for {column}: {e}")
+                                collected[col_name] = html_to_shopify_json(value)
+                            except Exception as err:
+                                print(f"Error parsing HTML for {col_name}: {err}")
                         else:
-                            metafields[column] = value
-                    elif column.startswith('Variant Metafield:'):
-                        value = row[column]
-                        if '[rich_text_field]' in column and isinstance(value, str) and '<' in value and '>' in value:
-                            try:
-                                json_value = html_to_shopify_json(value)
-                                variant_metafields[column] = json_value
-                            except Exception as e:
-                                print(f"Error parsing HTML for {column}: {e}")
-                        else:
-                            variant_metafields[column] = value
+                            collected[col_name] = value
+
+                    return collected
+
+                metafields = collect_metafields_from_row(row, 'Metafield:')
+                variant_metafields = collect_metafields_from_row(row, 'Variant Metafield:')
 
 
                 # Update metafields for the product
@@ -2243,6 +2261,7 @@ def run_uploader_logic():
             variant_id = update_or_create_variant_by_handle(handle, variant_data)
 
             if variant_id:
+                df.at[index, 'Variant ID'] = variant_id
                 print(f"Variant processed successfully with ID: {variant_id}")
                 # Proceed with additional logic using `variant_id`, like setting market-specific prices
 
