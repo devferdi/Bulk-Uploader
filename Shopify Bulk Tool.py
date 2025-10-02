@@ -264,7 +264,7 @@ def run_downloader_logic():
     ACCESS_TOKEN = credentials['access_token']
 
     # Shopify API URL
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
+    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07"
 
     # Headers for API authentication
     headers = {
@@ -367,7 +367,7 @@ def run_downloader_logic():
             }}
             """
         }
-        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07/graphql.json"
         response = requests.post(url, json=query, headers=headers)
         if response.status_code == 200:
             data = response.json()
@@ -699,8 +699,8 @@ def run_uploader_logic():
     ACCESS_TOKEN = credentials['access_token']
 
     # Shopify API URLs
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07"
+    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07/graphql.json"
 
     # Headers for API authentication
     headers = {
@@ -1109,17 +1109,15 @@ def run_uploader_logic():
             return False
 
         mutation = """
-        mutation AssignMediaToVariant($variantId: ID!, $mediaIds: [ID!]!) {
-            productVariantMediaAssign(
-                productVariantId: $variantId,
-                mediaIds: $mediaIds
-            ) {
-                media {
-                    id
-                    status
-                }
+        mutation AssignMediaToVariant($input: ProductVariantInput!) {
+            productVariantUpdate(input: $input) {
                 productVariant {
                     id
+                    media {
+                        nodes {
+                            id
+                        }
+                    }
                 }
                 userErrors {
                     field
@@ -1129,7 +1127,7 @@ def run_uploader_logic():
         }
         """
 
-        variables = {"variantId": variant_gid, "mediaIds": [media_gid]}
+        variables = {"input": {"id": variant_gid, "mediaId": media_gid}}
         context = f" for handle '{handle}'" if handle else ""
 
         try:
@@ -1161,7 +1159,7 @@ def run_uploader_logic():
 
         assignment_payload = (
             payload.get("data", {})
-            .get("productVariantMediaAssign", {})
+            .get("productVariantUpdate", {})
         )
 
         if not assignment_payload:
@@ -1176,21 +1174,19 @@ def run_uploader_logic():
                 f"Failed to assign media {media_gid} to variant {variant_gid}{context}: {user_errors}"
             )
             return False
-
-        media_statuses = assignment_payload.get("media") or []
-        failed_media = [
-            media_entry
-            for media_entry in media_statuses
-            if media_entry.get("status") and media_entry.get("status") not in {"READY", "SUCCESS"}
-        ]
-
         assigned_variant = assignment_payload.get("productVariant", {}) or {}
         assigned_variant_id = assigned_variant.get("id", variant_gid)
+        media_nodes = (
+            (assigned_variant.get("media") or {}).get("nodes")
+            if isinstance(assigned_variant.get("media"), dict)
+            else []
+        ) or []
+        assigned_media_ids = [node.get("id") for node in media_nodes if node.get("id")]
 
-        if failed_media:
+        if assigned_media_ids and media_gid not in assigned_media_ids:
             print(
-                f"Media assignment completed with warnings for variant {assigned_variant_id}{context}: "
-                f"{failed_media}"
+                f"Media assignment for variant {assigned_variant_id}{context} returned without the requested media ID. "
+                f"Variant media IDs: {assigned_media_ids}"
             )
             return False
 
@@ -3308,7 +3304,7 @@ def collection_run_downloader_logic():
     ACCESS_TOKEN = credentials['access_token']
 
     # Shopify API URL
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
+    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07"
     HEADERS = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
@@ -3470,8 +3466,8 @@ def collection_run_uploader_logic():
     ACCESS_TOKEN = credentials['access_token']
 
     # Shopify API URLs
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07"
+    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07/graphql.json"
 
     headers = {
         "Content-Type": "application/json",
@@ -4185,7 +4181,7 @@ def download_shopify_files_alt_texts():
     SHOP_NAME = credentials['store_name']
     ACCESS_TOKEN = credentials['access_token']
 
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07/graphql.json"
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
@@ -4273,7 +4269,7 @@ def upload_shopify_files_alt_texts():
     SHOP_NAME = credentials['store_name']
     ACCESS_TOKEN = credentials['access_token']
 
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-07/graphql.json"
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
