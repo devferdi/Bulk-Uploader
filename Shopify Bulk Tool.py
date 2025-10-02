@@ -1083,6 +1083,120 @@ def run_uploader_logic():
         return None, None  # Return None for both product ID and variant ID if creation fails
 
 
+    def assign_media_to_variant(variant_id, media_id, handle=None):
+        """Attach a media item to a product variant using Shopify's GraphQL API."""
+
+        if not variant_id:
+            print("Cannot assign media: missing variant ID.")
+            return False
+
+        if not media_id:
+            print(f"Cannot assign media to variant {variant_id}: missing media ID.")
+            return False
+
+        variant_gid = str(variant_id)
+        if not is_valid_gid(variant_gid):
+            variant_gid = f"gid://shopify/ProductVariant/{variant_gid}"
+
+        if not is_valid_gid(media_id):
+            print(
+                f"Cannot assign media to variant {variant_id}: "
+                f"media ID '{media_id}' is not a valid Shopify GID."
+            )
+            return False
+
+        mutation = """
+        mutation AssignVariantMedia($variantId: ID!, $mediaIds: [ID!]!) {
+            productVariantMediaAssign(variantId: $variantId, mediaIds: $mediaIds) {
+                media {
+                    id
+                    status
+                }
+                productVariant {
+                    id
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+
+        variables = {"variantId": variant_gid, "mediaIds": [media_id]}
+
+        context = f" for handle '{handle}'" if handle else ""
+
+        try:
+            response = requests.post(
+                GRAPHQL_URL,
+                headers=graphql_headers,
+                json={"query": mutation, "variables": variables},
+            )
+        except requests.RequestException as exc:
+            print(
+                f"Failed to assign media {media_id} to variant {variant_id}{context}: {exc}"
+            )
+            return False
+
+        if response.status_code != 200:
+            print(
+                f"Media assignment request failed for variant {variant_id}{context}: "
+                f"{response.status_code}, {response.text}"
+            )
+            return False
+
+        try:
+            response_json = response.json()
+        except ValueError:
+            print(
+                f"Received a non-JSON response while assigning media {media_id} to variant "
+                f"{variant_id}{context}: {response.text}"
+            )
+            return False
+
+        if response_json.get("errors"):
+            print(
+                f"GraphQL errors while assigning media {media_id} to variant {variant_id}{context}: "
+                f"{response_json.get('errors')}"
+            )
+            return False
+
+        assignment_payload = (
+            response_json.get("data", {})
+            .get("productVariantMediaAssign", {})
+        )
+
+        user_errors = assignment_payload.get("userErrors") or []
+        if user_errors:
+            print(
+                f"Failed to assign media {media_id} to variant {variant_id}{context}: "
+                f"{user_errors}"
+            )
+            return False
+
+        media_statuses = assignment_payload.get("media") or []
+        failed_media = [
+            media_entry
+            for media_entry in media_statuses
+            if media_entry.get("status") and media_entry.get("status") not in {"READY", "SUCCESS"}
+        ]
+
+        assigned_variant = assignment_payload.get("productVariant", {}) or {}
+        assigned_variant_id = assigned_variant.get("id", variant_gid)
+
+        if failed_media:
+            print(
+                f"Media assignment completed with warnings for variant {assigned_variant_id}{context}: "
+                f"{failed_media}"
+            )
+            return False
+
+        print(
+            f"Successfully assigned media {media_id} to variant {assigned_variant_id}{context}."
+        )
+        return True
+
     def update_or_create_variant(product_id, variant_id, updated_data):
         if not product_id:
             print("Product ID is required to create or update a variant.")
@@ -1140,6 +1254,79 @@ def run_uploader_logic():
         print("Variant ID not provided, creating a new variant.")
         created_variant_id = create_new_variant(product_id, updated_data)
         return (created_variant_id is not None), created_variant_id, None, None
+
+
+    def assign_media_to_variant(variant_gid, media_id):
+        if not variant_gid:
+            print("⚠️ Skipping media assignment because the variant GID is missing.")
+            return False, {"errors": ["Missing variant GID."]}
+
+        if not media_id:
+            print(
+                f"⚠️ Skipping media assignment for variant {variant_gid} because the media ID is missing."
+            )
+            return False, {"errors": ["Missing media ID."]}
+
+        mutation = """
+        mutation assignMediaToVariant($variantId: ID!, $mediaId: ID!) {
+            productVariantMediaAssign(
+                productVariantId: $variantId,
+                mediaId: $mediaId
+            ) {
+                productVariant {
+                    id
+                }
+                media {
+                    id
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+
+        payload = {
+            "query": mutation,
+            "variables": {
+                "variantId": variant_gid,
+                "mediaId": media_id,
+            },
+        }
+
+        try:
+            response = requests.post(
+                GRAPHQL_URL, json=payload, headers=graphql_headers
+            )
+        except requests.RequestException as exc:
+            print(
+                f"❌ Failed to assign media {media_id} to variant {variant_gid} due to a network error: {exc}"
+            )
+            return False, {"errors": [str(exc)]}
+
+        if response.status_code != 200:
+            print(
+                f"❌ Failed to assign media {media_id} to variant {variant_gid}: "
+                f"{response.status_code}, {response.text}"
+            )
+            return False, {"status": response.status_code, "body": response.text}
+
+        assignment_payload = (
+            response.json()
+            .get("data", {})
+            .get("productVariantMediaAssign", {})
+        )
+        user_errors = assignment_payload.get("userErrors") or []
+
+        if user_errors:
+            print(
+                f"❌ Failed to assign media {media_id} to variant {variant_gid}: {user_errors}"
+            )
+            return False, {"errors": user_errors}
+
+        print(f"✅ Assigned media {media_id} to variant {variant_gid}.")
+        return True, assignment_payload
 
 
     def update_or_create_variant_by_handle(handle, variant_data):
@@ -1210,6 +1397,10 @@ def run_uploader_logic():
                                         f"media_id={requested_media_id})."
                                     )
 
+                                if requested_media_id:
+                                    variant_gid = f"gid://shopify/ProductVariant/{updated_variant_id}"
+                                    assign_media_to_variant(variant_gid, requested_media_id)
+
                             return updated_variant_id  # Return the ID of the updated variant
 
                         failure_details = []
@@ -1243,6 +1434,10 @@ def run_uploader_logic():
                         new_variant_id = create_new_variant(product_id, variant_data)
                         if new_variant_id:
                             print(f"New variant created with ID {new_variant_id}.")
+                            requested_media_id = variant_data["variant"].get("media_id")
+                            if requested_media_id:
+                                variant_gid = f"gid://shopify/ProductVariant/{new_variant_id}"
+                                assign_media_to_variant(variant_gid, requested_media_id)
                         return new_variant_id  # Return the ID of the newly created variant
                 else:
                     print(f"Failed to fetch variants for product ID {product_id}: {variants_response.status_code}, {variants_response.text}")
@@ -1266,6 +1461,12 @@ def run_uploader_logic():
         }
         updated_data["variant"].update(required_options)
 
+        media_id_to_assign = (
+            updated_data.get("variant", {}).get("media_id")
+            if isinstance(updated_data, dict)
+            else None
+        )
+
         inventory_qty = updated_data["variant"].get("inventory_quantity") if isinstance(updated_data, dict) else None
 
         # Clean the data to remove NaN or unsupported values
@@ -1282,6 +1483,9 @@ def run_uploader_logic():
             if inventory_qty is not None:
                 inventory_item_id = created_variant.get("inventory_item_id")
                 set_inventory_level(inventory_item_id, inventory_qty)
+
+            if media_id_to_assign:
+                assign_media_to_variant(variant_id, media_id_to_assign)
 
             # Fetch all variants for the product after creating the new variant
             variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
@@ -1456,6 +1660,97 @@ def run_uploader_logic():
         else:
             print(f"Failed to get image URL for GID {gid}")
             return None
+
+    def assign_media_to_variant(variant_gid, media_id):
+        if not variant_gid or not media_id:
+            print(
+                f"Skipping productVariantUpdate: missing variant ({variant_gid}) or media ({media_id}) identifier."
+            )
+            return False
+
+        mutation = """
+        mutation productVariantUpdate($input: ProductVariantInput!) {
+            productVariantUpdate(input: $input) {
+                productVariant {
+                    id
+                    image {
+                        id
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+
+        variables = {"input": {"id": variant_gid, "mediaId": media_id}}
+
+        print(
+            f"Invoking productVariantUpdate to link media {media_id} with variant {variant_gid}."
+        )
+
+        try:
+            response = requests.post(
+                GRAPHQL_URL,
+                json={"query": mutation, "variables": variables},
+                headers=graphql_headers,
+            )
+        except requests.RequestException as exc:
+            print(
+                f"productVariantUpdate request failed for variant {variant_gid} with media {media_id}: {exc}"
+            )
+            return False
+
+        if response.status_code != 200:
+            print(
+                f"productVariantUpdate failed for variant {variant_gid} with media {media_id}: "
+                f"{response.status_code}, {response.text}"
+            )
+            return False
+
+        try:
+            payload = response.json()
+        except ValueError:
+            print(
+                f"productVariantUpdate returned non-JSON response for variant {variant_gid}: {response.text}"
+            )
+            return False
+
+        if payload.get("errors"):
+            print(
+                f"GraphQL errors from productVariantUpdate for variant {variant_gid}: {payload['errors']}"
+            )
+            return False
+
+        update_data = payload.get("data", {}).get("productVariantUpdate")
+        if not update_data:
+            print(
+                f"productVariantUpdate response missing data for variant {variant_gid}: {payload}"
+            )
+            return False
+
+        user_errors = update_data.get("userErrors") or []
+        if user_errors:
+            print(
+                f"Shopify user errors from productVariantUpdate for variant {variant_gid}: {user_errors}"
+            )
+            return False
+
+        product_variant = update_data.get("productVariant")
+        if product_variant:
+            print(
+                f"Media {media_id} successfully linked to variant "
+                f"{product_variant.get('id', variant_gid)} via productVariantUpdate."
+            )
+            return True
+
+        print(
+            f"productVariantUpdate response for variant {variant_gid} lacked productVariant details: {payload}"
+        )
+        return False
+
 
    
         
