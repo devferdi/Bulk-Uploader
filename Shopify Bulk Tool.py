@@ -18,6 +18,7 @@ from openpyxl import Workbook, load_workbook
 import requests
 import re
 import numbers
+import base64
 from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
@@ -1819,6 +1820,178 @@ def run_uploader_logic():
             existing_files = {}  # To avoid errors
         print(f"Fetched {len(existing_files)} existing files from Shopify.")
 
+        product_images_cache = {}
+
+        def get_product_images(product_id, force_refresh=False):
+            if not product_id:
+                return []
+
+            if not force_refresh and product_id in product_images_cache:
+                return product_images_cache[product_id]
+
+            url = f"{BASE_URL}/products/{product_id}/images.json"
+            try:
+                response = requests.get(url, headers=headers)
+            except requests.RequestException as exc:
+                print(f"Failed to retrieve images for product {product_id} due to network error: {exc}")
+                product_images_cache[product_id] = []
+                return []
+
+            if response.status_code == 200:
+                product_images = response.json().get('images', [])
+                product_images_cache[product_id] = product_images
+                return product_images
+
+            print(f"Failed to retrieve images for product {product_id}: {response.status_code}, {response.text}")
+            product_images_cache[product_id] = []
+            return []
+
+        def ensure_variant_image(product_id, image_value, alt_text, row_index, handle=None):
+            if not image_value:
+                return None
+
+            resolved_product_id = product_id
+            if resolved_product_id:
+                resolved_product_id = str(resolved_product_id)
+            elif handle:
+                lookup_url = f"{BASE_URL}/products.json?handle={handle}"
+                try:
+                    response = requests.get(lookup_url, headers=headers)
+                except requests.RequestException as exc:
+                    print(f"Failed to resolve product by handle '{handle}' for variant image: {exc}")
+                    return None
+
+                if response.status_code == 200:
+                    products = response.json().get('products', [])
+                    if products:
+                        resolved_product_id = str(products[0].get('id'))
+                else:
+                    print(
+                        f"Failed to resolve product by handle '{handle}' for variant image: "
+                        f"{response.status_code}, {response.text}"
+                    )
+                    return None
+
+            if not resolved_product_id:
+                return None
+
+            if isinstance(image_value, str):
+                image_reference = image_value.strip()
+            else:
+                image_reference = str(image_value)
+
+            if not image_reference:
+                return None
+
+            def update_variant_cell(resolved_url):
+                if row_index is not None and resolved_url:
+                    df.at[row_index, 'Variant Image'] = resolved_url
+
+            # If an explicit numeric image ID is provided, attempt to use it directly
+            try:
+                numeric_image_id = int(float(image_reference))
+                product_images = get_product_images(resolved_product_id)
+                for product_image in product_images:
+                    if int(product_image.get('id', 0)) == numeric_image_id:
+                        return product_image.get('id')
+            except (ValueError, TypeError):
+                pass
+
+            image_url = image_reference
+
+            if isinstance(image_url, str) and not image_url.startswith(('http://', 'https://', 'gid://')):
+                filename = image_url
+                if filename in existing_files:
+                    _, image_url = existing_files[filename]
+                else:
+                    file_path_local = os.path.join(IMAGE_FOLDER, filename)
+                    if not os.path.exists(file_path_local):
+                        print(
+                            f"Variant image file '{filename}' not found in local folder for product {resolved_product_id} "
+                            f"(row {row_index})."
+                        )
+                        return None
+
+                    try:
+                        with open(file_path_local, "rb") as image_file:
+                            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                    except OSError as exc:
+                        print(f"Failed to read variant image file '{filename}': {exc}")
+                        return None
+
+                    image_payload = {
+                        "image": {
+                            "attachment": encoded_string,
+                            "filename": filename,
+                        }
+                    }
+                    if alt_text:
+                        image_payload["image"]["alt"] = alt_text
+
+                    try:
+                        response = requests.post(
+                            f"{BASE_URL}/products/{resolved_product_id}/images.json",
+                            headers=headers,
+                            json=image_payload,
+                        )
+                    except requests.RequestException as exc:
+                        print(f"Failed to upload variant image '{filename}' for product {resolved_product_id}: {exc}")
+                        return None
+
+                    if response.status_code in (200, 201):
+                        image = response.json().get('image', {})
+                        image_url = image.get('src')
+                        existing_files[filename] = (image.get('id'), image_url)
+                        product_images_cache.pop(resolved_product_id, None)
+                        update_variant_cell(image_url)
+                    else:
+                        print(
+                            f"Failed to upload variant image '{filename}' for product {resolved_product_id}: "
+                            f"{response.status_code}, {response.text}"
+                        )
+                        return None
+
+            # Check if the product already has this image URL associated
+            product_images = get_product_images(resolved_product_id)
+            for product_image in product_images:
+                if product_image.get('src') == image_url:
+                    return product_image.get('id')
+
+            # Attach the remote image URL to the product if it isn't already present
+            image_payload = {"image": {"src": image_url}}
+            if alt_text:
+                image_payload["image"]["alt"] = alt_text
+
+            try:
+                response = requests.post(
+                    f"{BASE_URL}/products/{resolved_product_id}/images.json",
+                    headers=headers,
+                    json=image_payload,
+                )
+            except requests.RequestException as exc:
+                print(
+                    f"Failed to attach variant image from URL '{image_url}' for product {resolved_product_id}: {exc}"
+                )
+                return None
+
+            if response.status_code in (200, 201):
+                image = response.json().get('image', {})
+                resolved_url = image.get('src')
+                if resolved_url:
+                    update_variant_cell(resolved_url)
+                product_images_cache.pop(resolved_product_id, None)
+                refreshed_images = get_product_images(resolved_product_id, force_refresh=True)
+                for product_image in refreshed_images:
+                    if product_image.get('id') == image.get('id') or product_image.get('src') == resolved_url:
+                        return product_image.get('id')
+                return image.get('id')
+
+            print(
+                f"Failed to attach variant image '{image_url}' to product {resolved_product_id}: "
+                f"{response.status_code}, {response.text}"
+            )
+            return None
+
         # Fetch all market names dynamically
         def get_all_market_names():
             query = """
@@ -2294,19 +2467,9 @@ def run_uploader_logic():
                     update_product_images(product_id, images, alt_texts)
 
                     # Retrieve the updated images to get their IDs
-                    url = f"{BASE_URL}/products/{product_id}/images.json"
-                    response = requests.get(url, headers=headers)
-                    if response.status_code == 200:
-                        product_images = response.json().get('images', [])
-                        for image_data in product_images:
-                            image_src = image_data.get('src')
-                            image_id = image_data.get('id')
-                            if image_src in images:
-                                index_in_list = images.index(image_src)
-                                alt_text = alt_texts[index_in_list]
-
-                    else:
-                        print(f"Failed to retrieve images for product {product_id}: {response.status_code}, {response.text}")
+                    product_images = get_product_images(product_id, force_refresh=True)
+                    if not product_images:
+                        print(f"No images retrieved for product {product_id} after update.")
 
                 # Update metafields for the product
                 if metafields:
@@ -2316,50 +2479,47 @@ def run_uploader_logic():
                         print(f"Product ID missing for row {index}, cannot update metafields.")
 
             # Prepare the variant update data if there is a variant
-             # Prepare the variant update data if there is a variant
             if variant_name:
-
-
                 variant_data = {
-                "variant": {
-                    "id": variant_id,
-                    "price": row['Variant Price'],
-                    "option1": row.get('Option1 Value', ""),  # Add Option1 Value
-                    "option2": row.get('Option2 Value', ""),  # Add Option2 Value
-                    "option3": row.get('Option3 Value', "")   # Add Option3 Value
+                    "variant": {
+                        "id": variant_id,
+                        "price": row['Variant Price'],
+                        "option1": row.get('Option1 Value', ""),
+                        "option2": row.get('Option2 Value', ""),
+                        "option3": row.get('Option3 Value', ""),
+                    }
                 }
-            }   
 
-            # Conditionally add 'sku' if present and valid
-            if row.get('Variant SKU'):
-                variant_data["variant"]["sku"] = row['Variant SKU']
+                variant_image_value = row.get('Variant Image')
+                variant_image_alt = row.get('Variant Image Alt')
+                image_id = ensure_variant_image(product_id, variant_image_value, variant_image_alt, index, handle)
+                if image_id:
+                    variant_data["variant"]["image_id"] = image_id
 
-            # Conditionally add 'barcode' if present and valid
-            if row.get('Variant Barcode'):
-                variant_data["variant"]["barcode"] = str(int(row["Variant Barcode"])) if pd.notna(row.get("Variant Barcode")) and str(row.get("Variant Barcode")).strip() != "" else None
+                if row.get('Variant SKU'):
+                    variant_data["variant"]["sku"] = row['Variant SKU']
 
+                if row.get('Variant Barcode'):
+                    variant_data["variant"]["barcode"] = (
+                        str(int(row["Variant Barcode"]))
+                        if pd.notna(row.get("Variant Barcode")) and str(row.get("Variant Barcode")).strip() != ""
+                        else None
+                    )
 
-            # Conditionally add 'weight' if present and valid
-            if row.get('Variant Weight'):
-                variant_data["variant"]["weight"] = row['Variant Weight']
+                if row.get('Variant Weight'):
+                    variant_data["variant"]["weight"] = row['Variant Weight']
 
-            # Conditionally add 'weight_unit' if present and valid
-            if row.get('Variant Weight Unit'):
-                variant_data["variant"]["weight_unit"] = row['Variant Weight Unit']
+                if row.get('Variant Weight Unit'):
+                    variant_data["variant"]["weight_unit"] = row['Variant Weight Unit']
 
-             # Add inventory policy based on inventory quantity
-            variant_data["variant"]["inventory_policy"] = (
-                "continue" if not pd.notna(row.get("Variant Inventory Qty")) else "deny"
-            )
+                variant_data["variant"]["inventory_policy"] = (
+                    "continue" if not pd.notna(row.get("Variant Inventory Qty")) else "deny"
+                )
 
-
-            # Add inventory quantity to update stock levels and inventory management
-            if pd.notna(row.get("Variant Inventory Qty")):  # Check if the value is not NaN
-                inventory_qty = int(row["Variant Inventory Qty"])
-                variant_data["variant"]["inventory_quantity"] = inventory_qty
-                
-                # Automatically set inventory management based on the quantity
-                variant_data["variant"]["inventory_management"] = "shopify" if inventory_qty > 0 else None
+                if pd.notna(row.get("Variant Inventory Qty")):
+                    inventory_qty = int(row["Variant Inventory Qty"])
+                    variant_data["variant"]["inventory_quantity"] = inventory_qty
+                    variant_data["variant"]["inventory_management"] = "shopify" if inventory_qty > 0 else None
 
 
 
