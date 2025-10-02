@@ -2097,17 +2097,7 @@ def run_uploader_logic():
                     if response.status_code in (200, 201):
                         image = response.json().get('image', {})
                         image_url = image.get('src')
-                        image_gid = image.get('admin_graphql_api_id')
-
-                        if not (isinstance(image_gid, str) and image_gid.startswith('gid://')):
-                            uploaded_url, uploaded_gid = upload_image_to_shopify(file_path_local)
-                            if isinstance(uploaded_gid, str) and uploaded_gid.startswith('gid://'):
-                                image_gid = uploaded_gid
-                                image_url = uploaded_url or image_url
-
-                        if isinstance(image_gid, str) and image_gid.startswith('gid://'):
-                            remember_file_reference(existing_files, filename, image_gid, image_url)
-
+                        remember_file_reference(existing_files, filename, image.get('id'), image_url)
                         product_images_cache.pop(resolved_product_id, None)
                         update_variant_cell(image_url)
                     else:
