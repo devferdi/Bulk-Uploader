@@ -2347,6 +2347,8 @@ def run_uploader_logic():
 
         # Initialize a variable to store the last valid handle
         last_valid_handle = None
+        # Cache to avoid uploading the same variant image multiple times per product/option1
+        variant_image_cache = {}
         # Proceed with updating products and variants
         for index, row in df.iterrows():
             product_id = row.get('ID')
@@ -2649,7 +2651,66 @@ def run_uploader_logic():
 
                 variant_image_value = row.get('Variant Image')
                 variant_image_alt = row.get('Variant Image Alt')
-                image_id = ensure_variant_image(product_id, variant_image_value, variant_image_alt, index, handle)
+                option1_value = row.get('Option1 Value')
+                cache_key = None
+                cached_entry = None
+                cached_image_id = None
+                normalized_identifier = None
+
+                if isinstance(option1_value, str) and option1_value.strip():
+                    option1_identifier = option1_value.strip().lower()
+                elif pd.notna(option1_value):
+                    option1_identifier = str(option1_value).strip().lower()
+                else:
+                    option1_identifier = None
+
+                if handle:
+                    product_identifier = handle
+                else:
+                    product_identifier = product_id
+                if option1_identifier and product_identifier:
+                    cache_key = (str(product_identifier), option1_identifier)
+                    cached_entry = variant_image_cache.get(cache_key)
+
+                if isinstance(variant_image_value, str):
+                    normalized_identifier = variant_image_value.strip()
+                elif pd.notna(variant_image_value):
+                    normalized_identifier = str(variant_image_value).strip()
+
+                image_id = None
+
+                if cached_entry:
+                    cached_image_id = cached_entry.get("image_id")
+                    cached_url = cached_entry.get("url")
+                    cached_identifier = cached_entry.get("identifier")
+
+                    if not normalized_identifier and cached_identifier:
+                        normalized_identifier = cached_identifier
+
+                    if cached_identifier == normalized_identifier or not normalized_identifier:
+                        if cached_url:
+                            df.at[index, 'Variant Image'] = cached_url
+                        image_id = cached_image_id
+
+                if not image_id and variant_image_value:
+                    image_id = ensure_variant_image(
+                        product_id, variant_image_value, variant_image_alt, index, handle
+                    )
+                    if image_id and cache_key:
+                        resolved_url = df.at[index, 'Variant Image']
+                        variant_image_cache[cache_key] = {
+                            "image_id": image_id,
+                            "url": resolved_url if resolved_url else None,
+                            "identifier": normalized_identifier,
+                        }
+                elif image_id and cache_key and not cached_entry:
+                    resolved_url = df.at[index, 'Variant Image']
+                    variant_image_cache[cache_key] = {
+                        "image_id": image_id,
+                        "url": resolved_url if resolved_url else None,
+                        "identifier": normalized_identifier,
+                    }
+
                 if image_id:
                     variant_data["variant"]["image_id"] = image_id
 
