@@ -2078,22 +2078,137 @@ def run_uploader_logic():
 
         product_images_cache = {}
         product_image_identifier_cache = {}
+        product_media_cache = {}
+
+        def normalize_media_url(url):
+            if not isinstance(url, str):
+                return None
+            return url.split('?')[0]
+
+        def get_product_media(product_id_key, force_refresh=False):
+            if not product_id_key:
+                return []
+
+            if force_refresh:
+                product_media_cache.pop(product_id_key, None)
+
+            if not force_refresh and product_id_key in product_media_cache:
+                return product_media_cache[product_id_key]
+
+            product_gid = f"gid://shopify/Product/{product_id_key}"
+            query = """
+            query getProductMedia($id: ID!) {
+                product(id: $id) {
+                    media(first: 250) {
+                        nodes {
+                            __typename
+                            id
+                            ... on MediaImage {
+                                image {
+                                    id
+                                    url
+                                    originalSrc
+                                }
+                                previewImage {
+                                    url
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            """
+
+            payload = {"query": query, "variables": {"id": product_gid}}
+
+            try:
+                response = requests.post(GRAPHQL_URL, json=payload, headers=graphql_headers)
+            except requests.RequestException as exc:
+                print(
+                    f"Failed to retrieve media for product {product_id_key} due to network error: {exc}"
+                )
+                product_media_cache[product_id_key] = []
+                return []
+
+            if response.status_code == 200:
+                data = response.json()
+                media_nodes = (
+                    data.get("data", {})
+                    .get("product", {})
+                    .get("media", {})
+                    .get("nodes", [])
+                ) or []
+                product_media_cache[product_id_key] = media_nodes
+                return media_nodes
+
+            print(
+                f"Failed to retrieve media for product {product_id_key}: "
+                f"{response.status_code}, {response.text}"
+            )
+            product_media_cache[product_id_key] = []
+            return []
+
+        def match_media_id_for_image(media_nodes, src, product_image_gid):
+            normalized_src = normalize_media_url(src)
+            if not normalized_src:
+                return None
+
+            for node in media_nodes or []:
+                media_id = node.get("id")
+                if not media_id:
+                    continue
+
+                preview_image = node.get("previewImage") or node.get("preview_image") or {}
+                preview_url = preview_image.get("url") or preview_image.get("src")
+                if preview_url and normalize_media_url(preview_url) == normalized_src:
+                    return media_id
+
+                image_data = node.get("image") or {}
+                image_urls = [
+                    image_data.get("url"),
+                    image_data.get("originalSrc"),
+                    image_data.get("src"),
+                ]
+
+                if any(
+                    normalize_media_url(candidate_url) == normalized_src
+                    for candidate_url in image_urls
+                    if candidate_url
+                ):
+                    return media_id
+
+                image_id_candidate = image_data.get("id")
+                if (
+                    image_id_candidate
+                    and product_image_gid
+                    and image_id_candidate == product_image_gid
+                ):
+                    return media_id
+
+            return None
 
         def update_product_image_identifiers(product_id_key, images):
             by_src = {}
             by_id = {}
             by_gid = {}
 
+            media_nodes = get_product_media(product_id_key)
+
             for image in images or []:
                 image_id = image.get("id")
-                media_id = image.get("admin_graphql_api_id")
+                product_image_gid = image.get("admin_graphql_api_id")
                 src = image.get("src")
 
                 entry = {
                     "image_id": image_id,
-                    "media_id": media_id,
+                    "media_id": None,
                     "src": src,
+                    "product_image_gid": product_image_gid,
                 }
+
+                media_id = match_media_id_for_image(media_nodes, src, product_image_gid)
+                if media_id:
+                    entry["media_id"] = media_id
 
                 if src:
                     by_src[src] = entry
@@ -2104,6 +2219,9 @@ def run_uploader_logic():
                     except (TypeError, ValueError):
                         normalized_id = str(image_id)
                     by_id[normalized_id] = entry
+
+                if product_image_gid:
+                    by_gid[product_image_gid] = entry
 
                 if media_id:
                     by_gid[media_id] = entry
@@ -2123,6 +2241,7 @@ def run_uploader_logic():
             if force_refresh:
                 product_images_cache.pop(product_id_key, None)
                 product_image_identifier_cache.pop(product_id_key, None)
+                product_media_cache.pop(product_id_key, None)
 
             if not force_refresh and product_id_key in product_images_cache:
                 return product_images_cache[product_id_key]
@@ -2306,8 +2425,19 @@ def run_uploader_logic():
                         )
                         product_images_cache.pop(resolved_product_id, None)
                         product_image_identifier_cache.pop(resolved_product_id, None)
+                        product_media_cache.pop(resolved_product_id, None)
                         product_images = None
                         identifier_lookup = None
+                        load_image_metadata(force=True)
+                        lookup_by_src = (identifier_lookup or {}).get("by_src", {})
+                        refreshed_entry = lookup_by_src.get(image_url)
+                        if refreshed_entry and refreshed_entry.get("media_id"):
+                            remember_file_reference(
+                                existing_files,
+                                filename,
+                                refreshed_entry.get("media_id"),
+                                image_url,
+                            )
                         update_variant_cell(image_url)
                     else:
                         print(
@@ -2355,15 +2485,43 @@ def run_uploader_logic():
                     update_variant_cell(resolved_url)
                 product_images_cache.pop(resolved_product_id, None)
                 product_image_identifier_cache.pop(resolved_product_id, None)
+                product_media_cache.pop(resolved_product_id, None)
                 product_images = None
                 identifier_lookup = None
                 refreshed_images = get_product_images(resolved_product_id, force_refresh=True)
                 product_images = refreshed_images
                 identifier_lookup = product_image_identifier_cache.get(resolved_product_id, {})
+                lookup_by_src = (identifier_lookup or {}).get("by_src", {})
+                matched_entry = lookup_by_src.get(resolved_url)
+                if matched_entry and matched_entry.get("media_id"):
+                    remember_file_reference(
+                        existing_files,
+                        extract_filename_from_value(image_url),
+                        matched_entry.get("media_id"),
+                        resolved_url,
+                    )
+                    return matched_entry.get("image_id"), matched_entry.get("media_id")
+
                 for product_image in refreshed_images:
                     if product_image.get('id') == image.get('id') or product_image.get('src') == resolved_url:
-                        return extract_image_identifiers(product_image)
-                return extract_image_identifiers(image)
+                        identifiers = extract_image_identifiers(product_image)
+                        if identifiers[1]:
+                            remember_file_reference(
+                                existing_files,
+                                extract_filename_from_value(image_url),
+                                identifiers[1],
+                                resolved_url,
+                            )
+                        return identifiers
+                identifiers = extract_image_identifiers(image)
+                if identifiers[1]:
+                    remember_file_reference(
+                        existing_files,
+                        extract_filename_from_value(image_url),
+                        identifiers[1],
+                        resolved_url,
+                    )
+                return identifiers
 
             print(
                 f"Failed to attach variant image '{image_url}' to product {resolved_product_id}: "
