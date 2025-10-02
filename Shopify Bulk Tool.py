@@ -56,7 +56,13 @@ def build_file_lookup_keys(name):
     return {key for key in keys if key}
 
 
+def is_valid_gid(gid):
+    return isinstance(gid, str) and gid.startswith('gid://')
+
+
 def remember_file_reference(files_dict, filename, gid, url):
+    if not is_valid_gid(gid):
+        return
     for key in build_file_lookup_keys(filename):
         files_dict[key] = (gid, url)
 
@@ -1424,7 +1430,9 @@ def run_uploader_logic():
             if not url:
                 # Get URL via get_image_url_for_gid
                 url = get_image_url_for_gid(gid)
-            
+                if not url:
+                    print(f"⚠️ Unable to resolve URL for uploaded file with GID {gid}")
+
             return url, gid
         else:
             return None, None
@@ -1475,6 +1483,9 @@ def run_uploader_logic():
                             url = node['image'].get('url')
                         if alt:
                             remember_file_reference(all_files, alt, gid, url)
+                        filename = extract_filename_from_value(url)
+                        if filename:
+                            remember_file_reference(all_files, filename, gid, url)
                         cursor = file["cursor"]
 
                     has_next_page = data["data"]["files"]["pageInfo"]["hasNextPage"]
@@ -1567,10 +1578,13 @@ def run_uploader_logic():
                             file_path_local = resolve_local_asset_path(candidate)
                             if file_path_local:
                                 url, gid = upload_image_to_shopify(file_path_local)
-                                if gid and url:
+                                if gid:
                                     remember_file_reference(existing_files, filename or candidate, gid, url)
                                     value_gid = gid
-                                    df.at[row_index, column] = url
+                                    if url:
+                                        df.at[row_index, column] = url
+                                    else:
+                                        df.at[row_index, column] = value_gid
                                 else:
                                     print(f"❌ Failed to upload file {candidate} for metafield {namespace}.{key}")
                                     continue
@@ -1620,10 +1634,13 @@ def run_uploader_logic():
                                 if file_path_local:
                                     print(f"📤 Uploading {raw_name} to Shopify...")
                                     url, gid = upload_image_to_shopify(file_path_local)
-                                    if gid and url:
+                                    if gid:
                                         remember_file_reference(existing_files, filename or raw_name, gid, url)
                                         value_gid = gid
-                                        df.at[row_index, column] = url
+                                        if url:
+                                            df.at[row_index, column] = url
+                                        else:
+                                            df.at[row_index, column] = value_gid
                                     else:
                                         print(f"❌ Failed to upload file {raw_name}")
                                         continue
@@ -1771,10 +1788,13 @@ def run_uploader_logic():
                             file_path_local = resolve_local_asset_path(candidate)
                             if file_path_local:
                                 url, gid = upload_image_to_shopify(file_path_local)
-                                if gid and url:
+                                if gid:
                                     remember_file_reference(existing_files, filename or candidate, gid, url)
                                     value_gid = gid
-                                    df.at[row_index, column] = url
+                                    if url:
+                                        df.at[row_index, column] = url
+                                    else:
+                                        df.at[row_index, column] = value_gid
                                 else:
                                     print(f"❌ Failed to upload file {candidate} for variant metafield {namespace}.{key}")
                                     continue
@@ -1820,10 +1840,13 @@ def run_uploader_logic():
                                 file_path_local = resolve_local_asset_path(raw_name)
                                 if file_path_local:
                                     url, gid = upload_image_to_shopify(file_path_local)
-                                    if gid and url:
+                                    if gid:
                                         remember_file_reference(existing_files, filename or raw_name, gid, url)
                                         value_gid = gid
-                                        df.at[row_index, column] = url
+                                        if url:
+                                            df.at[row_index, column] = url
+                                        else:
+                                            df.at[row_index, column] = value_gid
                                     else:
                                         print(f"❌ Failed to upload file {raw_name}")
                                         continue
@@ -2331,10 +2354,26 @@ def run_uploader_logic():
                                     if response.status_code in [200, 201]:
                                         image = response.json().get('image', {})
                                         image_url = image.get('src')
+                                        image_gid = image.get('admin_graphql_api_id')
+
+                                        if not is_valid_gid(image_gid):
+                                            uploaded_url, uploaded_gid = upload_image_to_shopify(file_path_local)
+                                            if is_valid_gid(uploaded_gid):
+                                                image_gid = uploaded_gid
+                                                if uploaded_url:
+                                                    image_url = uploaded_url
+
                                         print(f"Successfully uploaded image {filename} to product {product_id}")
                                         # Update cell value with image URL
                                         df.at[index, image_column] = image_url
-                                        remember_file_reference(existing_files, filename, None, image_url)
+
+                                        if is_valid_gid(image_gid):
+                                            remember_file_reference(existing_files, filename, image_gid, image_url)
+                                        else:
+                                            print(
+                                                f"⚠️ Unable to determine gid for image {filename}; variant metafields will "
+                                                "re-upload if needed."
+                                            )
                                     else:
                                         print(f"Failed to upload image {filename} to product {product_id}: {response.status_code}, {response.text}")
                                 else:
@@ -3207,10 +3246,12 @@ def collection_run_uploader_logic():
             if not url:
                 # Get URL via get_image_url_for_gid
                 url = get_image_url_for_gid(gid)
-                
+                if not url:
+                    print(f"⚠️ Unable to resolve URL for uploaded file with GID {gid}")
+
             print(f"✅ Image uploaded successfully: GID={gid}, URL={url}")
 
-            return url, gid
+            return url, gid 
         else:
             return None, None
 
