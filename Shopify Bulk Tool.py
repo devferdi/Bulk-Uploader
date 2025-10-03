@@ -1136,6 +1136,8 @@ def run_uploader_logic():
                     )
 
                 updated_variant_id = variant_payload.get("id", variant_id)
+                if media_assignment:
+                    handle_variant_media_assignment(product_id, updated_variant_id, media_assignment)
                 return True, updated_variant_id, response_status, response_json
 
             elif response_status == 404:
@@ -1352,6 +1354,9 @@ def run_uploader_logic():
             if inventory_qty is not None:
                 inventory_item_id = created_variant.get("inventory_item_id")
                 set_inventory_level(inventory_item_id, inventory_qty)
+
+            if media_assignment and variant_id:
+                handle_variant_media_assignment(product_id, variant_id, media_assignment)
 
             requested_image_reference = resolved_image_id or requested_image_id
             response_image_id = created_variant.get("image_id")
@@ -2111,6 +2116,83 @@ def run_uploader_logic():
         product_image_identifier_cache = {}
         product_media_cache = {}
 
+        def normalize_numeric_id_str(identifier):
+            if identifier is None:
+                return None
+            if isinstance(identifier, str):
+                stripped = identifier.strip()
+                if not stripped:
+                    return None
+                if stripped.startswith("gid://"):
+                    stripped = stripped.split("/")[-1]
+                try:
+                    return str(int(float(stripped)))
+                except (ValueError, TypeError):
+                    return stripped
+            try:
+                return str(int(float(identifier)))
+            except (ValueError, TypeError):
+                return str(identifier)
+
+        def normalize_to_gid(resource, identifier):
+            if identifier is None:
+                return None
+            if isinstance(identifier, str):
+                stripped = identifier.strip()
+                if stripped.startswith("gid://"):
+                    return stripped
+            normalized = normalize_numeric_id_str(identifier)
+            if not normalized:
+                return None
+            return f"gid://shopify/{resource}/{normalized}"
+
+        def lookup_image_entry_by_identifier(product_id, identifier):
+            product_id_key = normalize_numeric_id_str(product_id)
+            if not product_id_key:
+                return None
+
+            identifier_lookup = product_image_identifier_cache.get(product_id_key)
+
+            if not identifier_lookup or not any(
+                identifier_lookup.get(bucket)
+                for bucket in ("by_id", "by_gid", "by_src")
+            ):
+                get_product_images(product_id_key)
+                identifier_lookup = product_image_identifier_cache.get(product_id_key, {})
+
+            candidate_keys = []
+            if identifier is not None:
+                identifier_str = str(identifier).strip()
+                if identifier_str:
+                    candidate_keys.append(identifier_str)
+                normalized_identifier = normalize_numeric_id_str(identifier)
+                if (
+                    normalized_identifier
+                    and normalized_identifier not in candidate_keys
+                ):
+                    candidate_keys.append(normalized_identifier)
+
+            lookup_by_id = (identifier_lookup or {}).get("by_id", {})
+            for key in candidate_keys:
+                entry = lookup_by_id.get(key)
+                if entry:
+                    return entry
+
+            lookup_by_gid = (identifier_lookup or {}).get("by_gid", {})
+            for key in candidate_keys:
+                entry = lookup_by_gid.get(key)
+                if entry:
+                    return entry
+
+            lookup_by_src = (identifier_lookup or {}).get("by_src", {})
+            for key in candidate_keys:
+                entry = lookup_by_src.get(key)
+                if entry:
+                    return entry
+
+            return None
+
+
         def normalize_media_url(url):
             if not isinstance(url, str):
                 return None
@@ -2157,12 +2239,13 @@ def run_uploader_logic():
             return None
 
         def prepare_variant_media_payload(product_id, variant_payload):
-            """Ensure variant payloads use image_id and drop unsupported media_id keys."""
+            """Ensure variant payloads use image_id and capture media identifiers for follow-up GraphQL assignment."""
 
             result = {
                 "requested_media_id": None,
                 "requested_image_id": None,
                 "resolved_image_id": None,
+                "resolved_media_id": None,
             }
 
             if not isinstance(variant_payload, dict):
@@ -2174,6 +2257,7 @@ def run_uploader_logic():
             result["requested_media_id"] = requested_media_id
             result["requested_image_id"] = requested_image_id
 
+            resolved_media_id = requested_media_id if requested_media_id else None
             resolved_image_id = requested_image_id
 
             if requested_media_id and not resolved_image_id:
@@ -2183,21 +2267,246 @@ def run_uploader_logic():
                         f"Warning: Could not resolve image_id for media ID {requested_media_id} "
                         f"on product {product_id}."
                     )
-                else:
-                    variant_payload["image_id"] = resolved_image_id
 
+            normalized_image_id_str = None
             if resolved_image_id is not None:
+                normalized_image_id_str = normalize_numeric_id_str(resolved_image_id)
+
+            if normalized_image_id_str and normalized_image_id_str.isdigit():
+                variant_payload["image_id"] = int(normalized_image_id_str)
+                resolved_image_id = int(normalized_image_id_str)
+            elif isinstance(resolved_image_id, (int, float)) and not isinstance(resolved_image_id, bool):
                 try:
-                    normalized_id = int(float(resolved_image_id))
+                    normalized_id = int(resolved_image_id)
                     variant_payload["image_id"] = normalized_id
                     resolved_image_id = normalized_id
                 except (TypeError, ValueError):
                     pass
 
+            lookup_identifier = (
+                resolved_image_id if resolved_image_id is not None else requested_image_id
+            )
+
+            if product_id and lookup_identifier is not None:
+                entry = lookup_image_entry_by_identifier(product_id, lookup_identifier)
+                if entry:
+                    media_candidate = entry.get("media_id") or entry.get("product_image_gid")
+                    if media_candidate:
+                        resolved_media_id = media_candidate
+
             variant_payload.pop("media_id", None)
 
-            result["resolved_image_id"] = resolved_image_id
+            result["resolved_image_id"] = (
+                resolved_image_id if resolved_image_id is not None else lookup_identifier
+            )
+            if resolved_media_id:
+                result["resolved_media_id"] = str(resolved_media_id)
+
             return result
+
+        def determine_media_id_for_assignment(product_id, media_assignment):
+            if not isinstance(media_assignment, dict):
+                return None
+
+            for key in ("resolved_media_id", "requested_media_id"):
+                candidate = media_assignment.get(key)
+                if isinstance(candidate, str) and candidate.strip().startswith("gid://"):
+                    return candidate.strip()
+
+            resolved_image_identifier = (
+                media_assignment.get("resolved_image_id")
+                if media_assignment.get("resolved_image_id") is not None
+                else media_assignment.get("requested_image_id")
+            )
+
+            if resolved_image_identifier is None:
+                return None
+
+            entry = lookup_image_entry_by_identifier(product_id, resolved_image_identifier)
+            if not entry:
+                return None
+
+            media_candidate = entry.get("media_id") or entry.get("product_image_gid")
+            if isinstance(media_candidate, str) and media_candidate.strip().startswith("gid://"):
+                media_assignment["resolved_media_id"] = media_candidate.strip()
+                return media_candidate.strip()
+
+            return None
+
+        def append_media_to_variant(product_id, variant_id, media_id):
+            product_gid = normalize_to_gid("Product", product_id)
+            variant_gid = normalize_to_gid("ProductVariant", variant_id)
+
+            if not product_gid or not variant_gid or not media_id:
+                return False
+
+            mutation = """
+            mutation appendVariantMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+              productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+            """
+
+            variables = {
+                "productId": product_gid,
+                "variantMedia": [
+                    {
+                        "variantId": variant_gid,
+                        "mediaId": media_id,
+                    }
+                ],
+            }
+
+            try:
+                response = requests.post(
+                    GRAPHQL_URL,
+                    headers=graphql_headers,
+                    json={"query": mutation, "variables": variables},
+                )
+            except requests.RequestException as exc:
+                print(
+                    f"Failed to append media {media_id} to variant {variant_id}: {exc}"
+                )
+                return False
+
+            if response.status_code != 200:
+                print(
+                    f"Failed to append media {media_id} to variant {variant_id}: "
+                    f"{response.status_code}, {response.text}"
+                )
+                return False
+
+            payload = response.json()
+            if payload.get("errors"):
+                print(
+                    f"GraphQL error while appending media to variant {variant_id}: {payload['errors']}"
+                )
+                return False
+
+            user_errors = (
+                payload.get("data", {})
+                .get("productVariantAppendMedia", {})
+                .get("userErrors")
+                or []
+            )
+
+            if user_errors:
+                non_blocking = True
+                for error in user_errors:
+                    message = (error or {}).get("message", "")
+                    if message and "already associated" in message.lower():
+                        continue
+                    non_blocking = False
+                    if message:
+                        print(
+                            f"Variant media append warning for variant {variant_id}: {message}"
+                        )
+                return non_blocking
+
+            return True
+
+        def update_variant_featured_media(variant_id, media_id):
+            variant_gid = normalize_to_gid("ProductVariant", variant_id)
+            if not variant_gid or not media_id:
+                return
+
+            mutation = """
+            mutation updateVariantFeatured($input: ProductVariantInput!) {
+              productVariantUpdate(input: $input) {
+                productVariant {
+                  id
+                  featuredMedia {
+                    id
+                  }
+                }
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+            """
+
+            def perform_update(field_name):
+                input_payload = {"id": variant_gid}
+                input_payload[field_name] = media_id
+                try:
+                    response = requests.post(
+                        GRAPHQL_URL,
+                        headers=graphql_headers,
+                        json={
+                            "query": mutation,
+                            "variables": {"input": input_payload},
+                        },
+                    )
+                except requests.RequestException as exc:
+                    print(
+                        f"Failed to update variant {variant_id} featured media: {exc}"
+                    )
+                    return False, False
+
+                if response.status_code != 200:
+                    print(
+                        f"Failed to update variant {variant_id} featured media: "
+                        f"{response.status_code}, {response.text}"
+                    )
+                    return False, False
+
+                payload = response.json()
+                fallback = False
+
+                errors = payload.get("errors") or []
+                if errors:
+                    messages = [err.get("message", "") for err in errors]
+                    if any(
+                        "Unknown argument \"featuredMediaId\"" in message
+                        for message in messages
+                    ) and field_name == "featuredMediaId":
+                        fallback = True
+                    else:
+                        print(
+                            f"GraphQL error while updating variant {variant_id} media: {errors}"
+                        )
+                    return False, fallback
+
+                result_payload = (
+                    payload.get("data", {}).get("productVariantUpdate") or {}
+                )
+                user_errors = result_payload.get("userErrors") or []
+                if user_errors:
+                    for error in user_errors:
+                        message = (error or {}).get("message")
+                        if message:
+                            print(
+                                f"Variant featured media update warning for variant {variant_id}: {message}"
+                            )
+                    return False, False
+
+                return True, False
+
+            success, fallback = perform_update("featuredMediaId")
+            if success:
+                return
+
+            if fallback:
+                perform_update("mediaId")
+
+        def handle_variant_media_assignment(product_id, variant_id, media_assignment):
+            if not variant_id or not isinstance(media_assignment, dict):
+                return
+
+            media_id = determine_media_id_for_assignment(product_id, media_assignment)
+            if not media_id:
+                return
+
+            media_assignment["resolved_media_id"] = media_id
+
+            append_media_to_variant(product_id, variant_id, media_id)
+            update_variant_featured_media(variant_id, media_id)
 
         def get_product_media(product_id_key, force_refresh=False):
             if not product_id_key:
