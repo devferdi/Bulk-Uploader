@@ -1083,117 +1083,7 @@ def run_uploader_logic():
         return None, None  # Return None for both product ID and variant ID if creation fails
 
 
-    def assign_media_to_variant(variant_identifier, media_identifier, handle=None):
-        """Attach a media item to a product variant using Shopify's GraphQL API."""
-
-        if not variant_identifier:
-            print("Cannot assign media: missing variant ID.")
-            return False
-
-        if not media_identifier:
-            print(
-                f"Cannot assign media to variant {variant_identifier}: missing media ID."
-            )
-            return False
-
-        variant_gid = str(variant_identifier)
-        if not is_valid_gid(variant_gid):
-            variant_gid = f"gid://shopify/ProductVariant/{variant_gid}"
-
-        media_gid = str(media_identifier)
-        if not is_valid_gid(media_gid):
-            print(
-                f"Cannot assign media to variant {variant_identifier}: "
-                f"media ID '{media_identifier}' is not a valid Shopify GID."
-            )
-            return False
-
-        mutation = """
-        mutation AssignMediaToVariant($input: ProductVariantInput!) {
-            productVariantUpdate(input: $input) {
-                productVariant {
-                    id
-                    media {
-                        nodes {
-                            id
-                        }
-                    }
-                }
-                userErrors {
-                    field
-                    message
-                }
-            }
-        }
-        """
-
-        variables = {"input": {"id": variant_gid, "mediaId": media_gid}}
-        context = f" for handle '{handle}'" if handle else ""
-
-        try:
-            response = requests.post(
-                GRAPHQL_URL,
-                headers=graphql_headers,
-                json={"query": mutation, "variables": variables},
-            )
-        except requests.RequestException as exc:
-            print(
-                f"Failed to assign media {media_gid} to variant {variant_gid}{context}: {exc}"
-            )
-            return False
-
-        if response.status_code != 200:
-            print(
-                f"Media assignment request failed for variant {variant_gid}{context}: "
-                f"{response.status_code}, {response.text}"
-            )
-            return False
-
-        try:
-            payload = response.json()
-        except ValueError:
-            print(
-                f"Media assignment response for variant {variant_gid}{context} was not valid JSON: {response.text}"
-            )
-            return False
-
-        assignment_payload = (
-            payload.get("data", {})
-            .get("productVariantUpdate", {})
-        )
-
-        if not assignment_payload:
-            print(
-                f"Media assignment response for variant {variant_gid}{context} was missing payload: {payload}"
-            )
-            return False
-
-        user_errors = assignment_payload.get("userErrors") or []
-        if user_errors:
-            print(
-                f"Failed to assign media {media_gid} to variant {variant_gid}{context}: {user_errors}"
-            )
-            return False
-        assigned_variant = assignment_payload.get("productVariant", {}) or {}
-        assigned_variant_id = assigned_variant.get("id", variant_gid)
-        media_nodes = (
-            (assigned_variant.get("media") or {}).get("nodes")
-            if isinstance(assigned_variant.get("media"), dict)
-            else []
-        ) or []
-        assigned_media_ids = [node.get("id") for node in media_nodes if node.get("id")]
-
-        if assigned_media_ids and media_gid not in assigned_media_ids:
-            print(
-                f"Media assignment for variant {assigned_variant_id}{context} returned without the requested media ID. "
-                f"Variant media IDs: {assigned_media_ids}"
-            )
-            return False
-
-        print(
-            f"Successfully assigned media {media_gid} to variant {assigned_variant_id}{context}."
-        )
-        return True
+    
 
     def update_or_create_variant(product_id, variant_id, updated_data):
         if not product_id:
@@ -1204,10 +1094,17 @@ def run_uploader_logic():
         if isinstance(updated_data, dict):
             inventory_qty = updated_data.get("variant", {}).get("inventory_quantity")
 
+        media_assignment = None
+        if isinstance(updated_data, dict) and "_media_assignment" in updated_data:
+            media_assignment = updated_data.pop("_media_assignment")
+
         if variant_id:
             url = f"{BASE_URL}/variants/{variant_id}.json"
             cleaned_data = clean_data(updated_data)
-            cleaned_data["variant"].pop('inventory_quantity', None)
+            variant_payload = cleaned_data.get("variant", {})
+            if isinstance(variant_payload, dict):
+                variant_payload.pop('inventory_quantity', None)
+                variant_payload.pop('media_id', None)
 
             try:
                 response = requests.put(url, headers=headers, json=cleaned_data)
@@ -1243,14 +1140,22 @@ def run_uploader_logic():
 
             elif response_status == 404:
                 print(f"Variant {variant_id} not found. Creating new variant.")
+                if media_assignment is not None:
+                    updated_data["_media_assignment"] = media_assignment
                 created_variant_id = create_new_variant(product_id, updated_data)
+                if media_assignment is not None:
+                    updated_data.pop("_media_assignment", None)
                 return (created_variant_id is not None), created_variant_id, response_status, response_json
 
             print(f"Failed to update variant {variant_id}: {response_status}, {response.text}")
             return False, None, response_status, response_json
 
         print("Variant ID not provided, creating a new variant.")
+        if media_assignment is not None:
+            updated_data["_media_assignment"] = media_assignment
         created_variant_id = create_new_variant(product_id, updated_data)
+        if media_assignment is not None:
+            updated_data.pop("_media_assignment", None)
         return (created_variant_id is not None), created_variant_id, None, None
 
 
@@ -1258,6 +1163,29 @@ def run_uploader_logic():
         if not handle:
             print("Handle not provided. Cannot update or create variant.")
             return None
+
+        if not isinstance(variant_data, dict):
+            print("Invalid variant data provided.")
+            return None
+
+        media_assignment = variant_data.pop("_media_assignment", None)
+        requested_media_id = None
+        requested_image_id = None
+        resolved_image_id = None
+
+        if isinstance(media_assignment, dict):
+            requested_media_id = media_assignment.get("requested_media_id")
+            requested_image_id = media_assignment.get("requested_image_id")
+            resolved_image_id = media_assignment.get("resolved_image_id")
+
+        variant_payload = variant_data.get("variant")
+        if not isinstance(variant_payload, dict):
+            print(f"Variant payload missing for handle '{handle}'.")
+            return None
+
+        if resolved_image_id and not variant_payload.get("image_id"):
+            variant_payload["image_id"] = resolved_image_id
+        variant_payload.pop("media_id", None)
 
         # Fetch product by handle
         url = f"{BASE_URL}/products.json?handle={handle}"
@@ -1267,6 +1195,12 @@ def run_uploader_logic():
             products = response.json().get('products', [])
             if products:
                 product_id = products[0]['id']
+                if requested_media_id and resolved_image_id is None:
+                    resolved_image_id = resolve_image_id_from_media_id(product_id, requested_media_id)
+                    if resolved_image_id and not variant_payload.get("image_id"):
+                        variant_payload["image_id"] = resolved_image_id
+                    if isinstance(media_assignment, dict):
+                        media_assignment["resolved_image_id"] = resolved_image_id
                 variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
                 variants_response = requests.get(variants_url, headers=headers)
 
@@ -1298,33 +1232,30 @@ def run_uploader_logic():
                     if existing_variant:
                         variant_id = existing_variant['id']
                         print(f"Existing variant found with ID {variant_id}. Updating variant.")
+                        variant_data["_media_assignment"] = media_assignment
                         (
                             success,
                             updated_variant_id,
                             response_status,
                             response_payload,
                         ) = update_or_create_variant(product_id, variant_id, variant_data)
+                        variant_data.pop("_media_assignment", None)
 
                         if success and updated_variant_id:
                             if isinstance(response_payload, dict):
                                 variant_response = response_payload.get("variant", {}) or {}
-                                requested_image_id = variant_data["variant"].get("image_id")
-                                requested_media_id = variant_data["variant"].get("media_id")
                                 response_image_id = variant_response.get("image_id")
+                                requested_image_reference = resolved_image_id or requested_image_id
 
                                 if (
-                                    (requested_image_id or requested_media_id)
+                                    (requested_image_reference or requested_media_id)
                                     and not response_image_id
                                 ):
                                     print(
                                         f"Warning: Shopify did not return an image_id for variant {updated_variant_id} "
-                                        f"after requesting image assignment (image_id={requested_image_id}, "
+                                        f"after requesting image assignment (image_id={requested_image_reference}, "
                                         f"media_id={requested_media_id})."
                                     )
-
-                                if requested_media_id:
-                                    variant_gid = f"gid://shopify/ProductVariant/{updated_variant_id}"
-                                    assign_media_to_variant(variant_gid, requested_media_id)
 
                             return updated_variant_id  # Return the ID of the updated variant
 
@@ -1340,12 +1271,11 @@ def run_uploader_logic():
                         elif response_payload:
                             failure_details.append(f"response: {response_payload}")
 
-                        requested_image_id = variant_data["variant"].get("image_id")
-                        requested_media_id = variant_data["variant"].get("media_id")
-                        if requested_image_id or requested_media_id:
+                        requested_image_reference = resolved_image_id or requested_image_id
+                        if requested_image_reference or requested_media_id:
                             failure_details.append(
                                 "requested "
-                                f"image_id={requested_image_id} media_id={requested_media_id}"
+                                f"image_id={requested_image_reference} media_id={requested_media_id}"
                             )
 
                         detail_message = "; ".join(detail for detail in failure_details if detail)
@@ -1356,13 +1286,11 @@ def run_uploader_logic():
                         return None
                     else:
                         print("No matching variant found. Creating a new variant.")
+                        variant_data["_media_assignment"] = media_assignment
                         new_variant_id = create_new_variant(product_id, variant_data)
+                        variant_data.pop("_media_assignment", None)
                         if new_variant_id:
                             print(f"New variant created with ID {new_variant_id}.")
-                            requested_media_id = variant_data["variant"].get("media_id")
-                            if requested_media_id:
-                                variant_gid = f"gid://shopify/ProductVariant/{new_variant_id}"
-                                assign_media_to_variant(variant_gid, requested_media_id)
                         return new_variant_id  # Return the ID of the newly created variant
                 else:
                     print(f"Failed to fetch variants for product ID {product_id}: {variants_response.status_code}, {variants_response.text}")
@@ -1386,17 +1314,33 @@ def run_uploader_logic():
         }
         updated_data["variant"].update(required_options)
 
-        media_id_to_assign = (
-            updated_data.get("variant", {}).get("media_id")
-            if isinstance(updated_data, dict)
-            else None
-        )
+        media_assignment = None
+        requested_media_id = None
+        requested_image_id = None
+        resolved_image_id = None
 
-        inventory_qty = updated_data["variant"].get("inventory_quantity") if isinstance(updated_data, dict) else None
+        if isinstance(updated_data, dict):
+            media_assignment = updated_data.pop("_media_assignment", None)
+            if isinstance(media_assignment, dict):
+                requested_media_id = media_assignment.get("requested_media_id")
+                requested_image_id = media_assignment.get("requested_image_id")
+                resolved_image_id = media_assignment.get("resolved_image_id")
+
+        variant_payload = updated_data.get("variant", {}) if isinstance(updated_data, dict) else {}
+
+        if isinstance(variant_payload, dict):
+            if resolved_image_id and not variant_payload.get("image_id"):
+                variant_payload["image_id"] = resolved_image_id
+            variant_payload.pop("media_id", None)
+
+        inventory_qty = variant_payload.get("inventory_quantity") if isinstance(variant_payload, dict) else None
 
         # Clean the data to remove NaN or unsupported values
         cleaned_data = clean_data(updated_data)
-        cleaned_data["variant"]["product_id"] = product_id  # Explicitly link to product
+        cleaned_variant_payload = cleaned_data.get("variant", {}) if isinstance(cleaned_data, dict) else {}
+        if isinstance(cleaned_variant_payload, dict):
+            cleaned_variant_payload.pop("media_id", None)
+            cleaned_variant_payload["product_id"] = product_id  # Explicitly link to product
 
         response = requests.post(url, headers=headers, json=cleaned_data)
         if response.status_code in [200, 201]:
@@ -1409,8 +1353,17 @@ def run_uploader_logic():
                 inventory_item_id = created_variant.get("inventory_item_id")
                 set_inventory_level(inventory_item_id, inventory_qty)
 
-            if media_id_to_assign:
-                assign_media_to_variant(variant_id, media_id_to_assign)
+            requested_image_reference = resolved_image_id or requested_image_id
+            response_image_id = created_variant.get("image_id")
+            if (
+                (requested_image_reference or requested_media_id)
+                and not response_image_id
+            ):
+                print(
+                    f"Warning: Shopify did not return an image_id for new variant {variant_id} "
+                    f"after requesting image assignment (image_id={requested_image_reference}, "
+                    f"media_id={requested_media_id})."
+                )
 
             # Fetch all variants for the product after creating the new variant
             variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
@@ -1439,7 +1392,12 @@ def run_uploader_logic():
         elif response.status_code == 429:
             print("Rate limit exceeded. Pausing to retry...")
             time.sleep(1)  # Delay for one second before retrying
-            return create_new_variant(product_id, updated_data)
+            if media_assignment is not None:
+                updated_data["_media_assignment"] = media_assignment
+            retry_variant_id = create_new_variant(product_id, updated_data)
+            if media_assignment is not None:
+                updated_data.pop("_media_assignment", None)
+            return retry_variant_id
         else:
             print(f"Failed to create variant: {response.status_code}, {response.text}")
 
@@ -2157,6 +2115,89 @@ def run_uploader_logic():
             if not isinstance(url, str):
                 return None
             return url.split('?')[0]
+
+        def resolve_image_id_from_media_id(product_id, media_identifier):
+            """Resolve a numeric image_id from a GraphQL media ID for the given product."""
+
+            if not product_id or not media_identifier:
+                return None
+
+            product_id_key = str(product_id)
+            media_id_str = str(media_identifier)
+
+            def lookup_cached_identifier():
+                identifier_lookup = product_image_identifier_cache.get(product_id_key)
+                if not identifier_lookup:
+                    return None
+                by_gid = identifier_lookup.get("by_gid") or {}
+                entry = by_gid.get(media_id_str)
+                if entry and entry.get("image_id") is not None:
+                    return entry.get("image_id")
+                return None
+
+            resolved_id = lookup_cached_identifier()
+            if resolved_id:
+                return resolved_id
+
+            get_product_images(product_id_key)
+            resolved_id = lookup_cached_identifier()
+            if resolved_id:
+                return resolved_id
+
+            get_product_images(product_id_key, force_refresh=True)
+            resolved_id = lookup_cached_identifier()
+            if resolved_id:
+                return resolved_id
+
+            if isinstance(media_id_str, str):
+                match = re.search(r"/(\d+)(?:\?.*)?$", media_id_str)
+                if match:
+                    return match.group(1)
+
+            return None
+
+        def prepare_variant_media_payload(product_id, variant_payload):
+            """Ensure variant payloads use image_id and drop unsupported media_id keys."""
+
+            result = {
+                "requested_media_id": None,
+                "requested_image_id": None,
+                "resolved_image_id": None,
+            }
+
+            if not isinstance(variant_payload, dict):
+                return result
+
+            requested_media_id = variant_payload.get("media_id")
+            requested_image_id = variant_payload.get("image_id")
+
+            result["requested_media_id"] = requested_media_id
+            result["requested_image_id"] = requested_image_id
+
+            resolved_image_id = requested_image_id
+
+            if requested_media_id and not resolved_image_id:
+                resolved_image_id = resolve_image_id_from_media_id(product_id, requested_media_id)
+                if resolved_image_id is None:
+                    print(
+                        f"Warning: Could not resolve image_id for media ID {requested_media_id} "
+                        f"on product {product_id}."
+                    )
+                else:
+                    variant_payload["image_id"] = resolved_image_id
+
+            if resolved_image_id is not None:
+                try:
+                    normalized_id = int(float(resolved_image_id))
+                    variant_payload["image_id"] = normalized_id
+                    resolved_image_id = normalized_id
+                except (TypeError, ValueError):
+                    pass
+
+            variant_payload.pop("media_id", None)
+
+            result["resolved_image_id"] = resolved_image_id
+            return result
 
         def get_product_media(product_id_key, force_refresh=False):
             if not product_id_key:
@@ -3223,9 +3264,13 @@ def run_uploader_logic():
 
 
 
+                media_assignment = prepare_variant_media_payload(product_id, variant_data.get("variant", {}))
+                variant_data["_media_assignment"] = media_assignment
+
             print(f"Updating or creating variant for handle '{handle}':")
             time.sleep(1)  # Delay for half a second before retrying
             variant_id = update_or_create_variant_by_handle(handle, variant_data)
+            variant_data.pop("_media_assignment", None)
 
             if variant_id:
                 df.at[index, 'Variant ID'] = variant_id
