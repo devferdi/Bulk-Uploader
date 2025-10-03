@@ -709,6 +709,277 @@ def run_uploader_logic():
     }
     graphql_headers = headers.copy()
 
+    global append_media_to_variant, get_product_id_by_handle
+
+    def _get_media_status(media_gid):
+        """
+        Return 'READY' | 'PROCESSING' | 'FAILED' for a Media gid.
+        """
+        query = """
+        query MediaStatus($id: ID!) {
+          node(id: $id) {
+            ... on MediaImage {
+              id
+              status
+              image { id }
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"id": media_gid}, purpose="Media status")
+        node = (data or {}).get("data", {}).get("node", {}) or {}
+        return node.get("status")
+
+    def _wait_until_media_ready(media_gid, timeout_s=180, interval_s=2):
+        """
+        Poll the media until Shopify finishes processing it.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            status = _get_media_status(media_gid)
+            if status == "READY":
+                return True
+            if status == "FAILED":
+                print(f"❌ Media {media_gid} failed processing; cannot attach to variant.")
+                return False
+            time.sleep(interval_s)
+        print(f"⚠️ Timed out waiting for media {media_gid} to become READY.")
+        return False
+
+
+    def _graphql_post(query, variables=None, purpose="(unspecified)"):
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            resp = requests.post(GRAPHQL_URL, headers=graphql_headers, json=payload, timeout=30)
+        except Exception as e:
+            print(f"❌ GraphQL {purpose} request failed to send: {e}")
+            return None
+
+        # Try to parse JSON, log raw text when impossible
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"❌ GraphQL {purpose} non-JSON response. HTTP {resp.status_code}. Body:\n{resp.text[:800]}")
+            return None
+
+        # Shopify GraphQL may attach top-level "errors"
+        if "errors" in data:
+            print(f"❌ GraphQL {purpose} errors: {data['errors']}")
+        return data
+
+    def to_gid(resource, numeric_id):
+        return f"gid://shopify/{resource}/{numeric_id}"
+
+    def get_product_id_by_handle(handle):
+        url = f"{BASE_URL}/products.json?handle={handle}"
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200 and r.json().get("products"):
+            return r.json()["products"][0]["id"]
+        print(f"⚠️ Could not find product by handle '{handle}'. HTTP {r.status_code} Body: {r.text[:400]}")
+        return None
+
+    def _get_product_image_info(product_id, product_image_gid):
+        """
+        From a Product + ProductImage GID, fetch URL and alt text for that image.
+        Returns dict: {"url": str, "alt": str} or None.
+        """
+        query = """
+        query ProductImages($id: ID!) {
+          product(id: $id) {
+            id
+            images(first: 250) {
+              nodes {
+                id
+                url
+                altText
+              }
+            }
+          }
+        }
+        """
+        product_gid = to_gid("Product", product_id)
+        data = _graphql_post(query, {"id": product_gid}, purpose="ProductImages lookup")
+        if not data:
+            return None
+
+        nodes = (data.get("data", {})
+                    .get("product", {})
+                    .get("images", {})
+                    .get("nodes", []))
+        for node in nodes:
+            if node.get("id") == product_image_gid:
+                return {"url": node.get("url"), "alt": node.get("altText")}
+
+        print(f"⚠️ Did not find ProductImage {product_image_gid} in product images list.")
+        return None
+
+    def _create_mediaimage_from_productimage(product_id, image_url, alt_text=None):
+        """
+        Calls productCreateMedia to create a MediaImage from a raw image URL.
+        Returns the new MediaImage gid or None.
+        """
+        mutation = """
+        mutation CreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+          productCreateMedia(productId: $productId, media: $media) {
+            media {
+              __typename
+              ... on MediaImage {
+                id
+                image { id }
+              }
+            }
+            mediaUserErrors { field message code }
+          }
+        }
+        """
+        variables = {
+            "productId": to_gid("Product", product_id),
+            "media": [{
+                "mediaContentType": "IMAGE",  # <-- REQUIRED
+                "originalSource": image_url,
+                "alt": alt_text or ""
+            }]
+        }
+        data = _graphql_post(mutation, variables, purpose="productCreateMedia")
+        if not data:
+            print("❌ No data returned from productCreateMedia.")
+            return None
+
+        errs = (data.get("data", {})
+                    .get("productCreateMedia", {})
+                    .get("mediaUserErrors", []))
+        if errs:
+            print(f"❌ productCreateMedia errors: {errs}")
+            return None
+
+        media_nodes = (data.get("data", {})
+                           .get("productCreateMedia", {})
+                           .get("media", []))
+        for node in media_nodes:
+            if node.get("__typename") == "MediaImage":
+                return node.get("id")
+
+        print("⚠️ productCreateMedia returned no MediaImage nodes.")
+        return None
+
+    def _resolve_mediaimage_id_from_productimage_gid(product_gid, product_image_gid):
+        """
+        Map legacy ProductImage GID -> MediaImage GID by querying product.media and matching image.id.
+        Returns a MediaImage gid or None (does NOT create).
+        """
+        query = """
+        query ProductMedia($id: ID!) {
+          product(id: $id) {
+            id
+            media(first: 250) {
+              nodes {
+                __typename
+                ... on MediaImage {
+                  id
+                  image { id }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"id": product_gid}, purpose="ProductMedia lookup")
+        if not data:
+            return None
+
+        nodes = (data.get("data", {})
+                    .get("product", {})
+                    .get("media", {})
+                    .get("nodes", []))
+        for node in nodes:
+            if node.get("__typename") == "MediaImage":
+                image = node.get("image") or {}
+                if image.get("id") == product_image_gid:
+                    return node.get("id")
+        return None
+
+    def _ensure_media_gid_for_append(product_id, incoming_gid):
+        """
+        Ensure we pass a Media gid to productVariantAppendMedia.
+        If we receive a ProductImage gid, try to map. If mapping fails, create a MediaImage from that ProductImage.
+        """
+        if incoming_gid and incoming_gid.startswith("gid://shopify/Media"):
+            return incoming_gid  # already a media gid
+
+        if incoming_gid and incoming_gid.startswith("gid://shopify/ProductImage/"):
+            product_gid = to_gid("Product", product_id)
+
+            # 1) Try to map an existing MediaImage
+            mapped = _resolve_mediaimage_id_from_productimage_gid(product_gid, incoming_gid)
+            if mapped:
+                return mapped
+
+            print(f"⚠️ No MediaImage found that corresponds to ProductImage {incoming_gid}; creating one via productCreateMedia...")
+
+            # 2) Create MediaImage from ProductImage (needs image URL)
+            info = _get_product_image_info(product_id, incoming_gid)
+            if not info or not info.get("url"):
+                print(f"❌ Could not fetch URL for {incoming_gid}; cannot create MediaImage.")
+                return None
+
+            created_media_gid = _create_mediaimage_from_productimage(product_id, info["url"], info.get("alt"))
+            if created_media_gid:
+                return created_media_gid
+
+            return None
+
+        print(f"⚠️ Unsupported media identifier (expect Media* or ProductImage gid): {incoming_gid}")
+        return None
+
+    def append_media_to_variant(product_id, variant_id, incoming_media_gid):
+        media_gid = _ensure_media_gid_for_append(product_id, incoming_media_gid)
+        if not media_gid:
+            print(f"❌ Cannot append to variant {variant_id}: failed to resolve a Media gid from {incoming_media_gid}")
+            return
+
+        # 👇 NEW: wait for READY just before append (safe for existing media too)
+        _wait_until_media_ready(media_gid, timeout_s=180, interval_s=2)
+
+        mutation = """
+        mutation AppendVariantMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+          productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+            userErrors { field message code }
+          }
+        }
+        """
+        variables = {
+            "productId": to_gid("Product", product_id),
+            "variantMedia": [{
+                "variantId": to_gid("ProductVariant", variant_id),
+                "mediaIds": [media_gid]
+            }]
+        }
+
+        data = _graphql_post(mutation, variables, purpose="productVariantAppendMedia")
+        if not data:
+            print(f"❌ No data returned from productVariantAppendMedia for variant {variant_id}")
+            return
+
+        user_errors = (data.get("data", {})
+                           .get("productVariantAppendMedia", {})
+                           .get("userErrors", []))
+        if user_errors:
+            # Optional: auto-retry once if NON_READY_MEDIA somehow sneaks through
+            if any(err.get("code") == "NON_READY_MEDIA" for err in user_errors):
+                print("⏳ Media not ready at append time; waiting a bit and retrying once...")
+                _wait_until_media_ready(media_gid, timeout_s=60, interval_s=2)
+                data = _graphql_post(mutation, variables, purpose="productVariantAppendMedia (retry)")
+                user_errors = (data.get("data", {})
+                                   .get("productVariantAppendMedia", {})
+                                   .get("userErrors", []))
+            if user_errors:
+                print(f"❌ productVariantAppendMedia errors for variant {variant_id}: {user_errors}")
+            else:
+                print(f"✅ Appended media {media_gid} to variant {variant_id}")
+        else:
+            print(f"✅ Appended media {media_gid} to variant {variant_id}")
+
+
     # Image folder path
     IMAGE_FOLDER = os.path.join(script_dir, 'img')  # Adjusted to your images folder
     FILE_FOLDER = os.path.join(script_dir, 'files')  # Optional folder for non-image assets
@@ -2960,8 +3231,6 @@ def run_uploader_logic():
 
                 if image_id:
                     variant_data["variant"]["image_id"] = image_id
-                if media_id:
-                    variant_data["variant"]["media_id"] = media_id
 
                 if row.get('Variant SKU'):
                     variant_data["variant"]["sku"] = row['Variant SKU']
@@ -3000,6 +3269,15 @@ def run_uploader_logic():
                 df.at[index, 'Variant ID'] = variant_id
                 print(f"Variant processed successfully with ID: {variant_id}")
                 # Proceed with additional logic using `variant_id`, like setting market-specific prices
+
+                                # If we resolved a GraphQL media GID for the variant’s image, append it to the variant
+                if media_id:
+                    pid = get_product_id_by_handle(handle)
+                    if pid:
+                        append_media_to_variant(pid, variant_id, media_id)
+                    else:
+                        print(f"⚠️ Could not resolve product_id for handle '{handle}' to append media.")
+
 
                 # Handle market-specific pricing dynamically
                 for column, market_name in pricing_columns.items():
